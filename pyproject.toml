@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bookreader"
+version = "0.1.0"
+description = "Upload a book; get an audio drama with character voices, music, and sound effects."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "python-multipart>=0.0.9",
+  "pydantic>=2.6",
+  "numpy>=1.26",
+  "ebooklib>=0.18",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=1,<2"]
+elevenlabs = ["elevenlabs>=2,<3"]
+local = ["piper-tts>=1.2", "transformers>=4.44", "torch>=2.2"]
+local-kokoro = ["kokoro>=0.9", "soundfile>=0.12"]
+pdf = ["pypdf>=4"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "httpx>=0.27"]
+
+[project.scripts]
+bookreader = "bookreader.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bookreader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+timeout = 40
