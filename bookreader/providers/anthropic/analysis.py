@@ -5,8 +5,16 @@ thinking left to the model). The reply is parsed into :class:`bookreader.types.C
 and repaired by :func:`bookreader.analysis.validate.validate_chunk_analysis`; an unusable reply
 gets exactly one repair request carrying a note about what was wrong, and if that fails too the
 heuristic fallback labels the chunk (never a job failure). Refusals fall back the same way; a
-truncated reply splits the chunk in half and analyzes each half. SDK failures are mapped onto
-the bookreader error taxonomy and transient ones are retried by :func:`bookreader.retry.with_retry`.
+reply truncated at ``max_tokens`` splits the chunk in half and analyzes each half, and a request
+that hit the model's context window (``model_context_window_exceeded``) goes straight to the
+heuristic fallback (a repair request would only be larger). SDK failures are mapped onto the
+bookreader error taxonomy and transient ones are retried by :func:`bookreader.retry.with_retry`.
+
+Retry and concurrency policy: this adapter is the only layer that retries (4 attempts, backoff
+and ``retry-after`` honoured; the SDK client is built with ``max_retries=0`` so one failing
+request costs at most 4 HTTP attempts) and the only layer that acquires the ``anthropic``
+FamilyLimiter (the pipeline never wraps ``analyze_chunk`` in it again: nesting the same semaphore
+deadlocks at width 1).
 
 The ``anthropic`` SDK is never imported at module level: ``check``/``from_settings`` import it
 under ``try`` (so the registry can report the missing extra) and the exception classes are looked
@@ -22,6 +30,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import ValidationError
 
+from bookreader.analysis.chunker import carry_speakers
 from bookreader.analysis.prompts import SYSTEM_PROMPT, build_user_message
 from bookreader.analysis.schema import CHUNK_ANALYSIS_SCHEMA, PROMPT_VERSION
 from bookreader.analysis.validate import AnalysisInvalid, validate_chunk_analysis
@@ -47,12 +56,20 @@ log = logging.getLogger(__name__)
 FAMILY = "anthropic"
 INSTALL_HINT = "pip install 'bookreader[anthropic]'"
 MISSING_SDK = f"analysis provider 'anthropic' needs the anthropic SDK: {INSTALL_HINT}"
-CLIENT_MAX_RETRIES = 3
+CLIENT_MAX_RETRIES = 0                       # bookreader.retry.with_retry is the single retry layer
 CLIENT_TIMEOUT_S = 600
 USAGE_UNIT_TYPES: tuple[str, ...] = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 TRANSIENT_STATUS: frozenset[int] = frozenset({408, 409, 429})
 TRANSIENT_CLASSES: tuple[str, ...] = ("RateLimitError", "InternalServerError", "APITimeoutError", "APIConnectionError")
 PERMANENT_CLASSES: tuple[str, ...] = ("BadRequestError", "AuthenticationError", "PermissionDeniedError", "NotFoundError")
+# ``error.type`` values from the API's error body. An SSE ``error`` event received after the
+# stream has started surfaces as a bare APIStatusError whose status_code is the stream's 200, so
+# the body type is the only signal that the failure was transient.
+TRANSIENT_ERROR_TYPES: frozenset[str] = frozenset({"overloaded_error", "api_error", "rate_limit_error"})
+PERMANENT_ERROR_TYPES: frozenset[str] = frozenset(
+    {"invalid_request_error", "authentication_error", "permission_error", "not_found_error", "request_too_large"}
+)
+STREAM_OK_STATUS = 200
 REPAIR_NOTE_MAX_CHARS = 1500
 CONTEXT_PARAGRAPHS = 2
 SPAN_ID_RE = re.compile(r"^c\d+p(\d+)s\d+$")
@@ -89,6 +106,18 @@ def _retry_after(exc: BaseException) -> float | None:
     return None
 
 
+def _body_error_type(exc: BaseException) -> str | None:
+    """``error.type`` from the SDK exception's parsed body, when it has one."""
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    kind = error.get("type")
+    return str(kind) if isinstance(kind, str) else None
+
+
 def map_error(exc: BaseException) -> BookreaderError:
     """Translate an SDK exception into the bookreader taxonomy.
 
@@ -97,17 +126,27 @@ def map_error(exc: BaseException) -> BookreaderError:
     from the response headers when present); BadRequestError, AuthenticationError,
     PermissionDeniedError, NotFoundError and every other status error become
     ProviderPermanentError. Bookreader errors pass through unchanged.
+
+    An ``error`` SSE event after the stream has started (``overloaded_error``, ``api_error``) is
+    raised by the SDK as a bare APIStatusError carrying the stream's own 200 status, so the body's
+    ``error.type`` is consulted first: a transient type is always transient, and a 200-status error
+    is transient unless its type is a known permanent one.
     """
     if isinstance(exc, BookreaderError):
         return exc
     sdk = _sdk_module()
     message = f"anthropic: {exc}" if str(exc) else f"anthropic: {type(exc).__name__}"
     status = getattr(exc, "status_code", None)
+    error_type = _body_error_type(exc)
     if _isinstance_named(exc, sdk, TRANSIENT_CLASSES):
+        return ProviderTransientError(message, retry_after=_retry_after(exc))
+    if error_type in TRANSIENT_ERROR_TYPES:
         return ProviderTransientError(message, retry_after=_retry_after(exc))
     if _isinstance_named(exc, sdk, PERMANENT_CLASSES):
         return ProviderPermanentError(message)
     if isinstance(status, int) and (status in TRANSIENT_STATUS or status >= 500):
+        return ProviderTransientError(message, retry_after=_retry_after(exc))
+    if status == STREAM_OK_STATUS and error_type not in PERMANENT_ERROR_TYPES:
         return ProviderTransientError(message, retry_after=_retry_after(exc))
     return ProviderPermanentError(message)
 
@@ -258,6 +297,11 @@ class ClaudeAnalyzer:
             return self._refused(msg, chunk, bible, unit)
         if stop_reason == "max_tokens":
             return self._split_and_retry(chunk, bible, unit)
+        if stop_reason == "model_context_window_exceeded":
+            # The reply is cut off and a repair request (same prompt plus a note) is strictly larger,
+            # so it would hit the same stop; halving the span list would not shrink the bible either.
+            log.warning("%s: request hit the model context window; using the heuristic analyzer", unit)
+            return self._fallback(chunk, bible, "context_window_exceeded")
         try:
             analysis = self._parse(msg, chunk, bible)
         except ValueError as exc:  # AnalysisInvalid, pydantic ValidationError and JSONDecodeError all subclass it
@@ -279,12 +323,19 @@ class ClaudeAnalyzer:
         if text is None:
             raise ValueError("the reply contained no text block")
         data = json.loads(text)
+        if isinstance(data, dict):
+            for character in data.get("characters") or []:
+                if isinstance(character, dict) and character.get("merge_into") == "":
+                    character["merge_into"] = None          # the schema's "no merge" spelling
         analysis = ChunkAnalysis.model_validate(data).model_copy(update={"source": "llm"})
         repaired, _ = validate_chunk_analysis(analysis, chunk, bible)
         return repaired
 
     def _request(self, chunk: Chunk, bible: CastBible, unit: str, repair_note: str | None) -> Any:
-        """One structured-output call under the family semaphore, retried on transient errors."""
+        """One structured-output call under the family semaphore, retried on transient errors.
+
+        The semaphore is held only while a request is in flight (``with_retry`` sleeps outside
+        it) and nowhere else in the process, so width 1 never deadlocks."""
         kwargs = self._request_kwargs(chunk, bible, repair_note)
 
         def attempt() -> Any:
@@ -349,7 +400,9 @@ class ClaudeAnalyzer:
             "%s: output truncated at %d tokens; splitting paragraphs %d-%d / %d-%d",
             unit, self.max_tokens, head.paragraph_start, head.paragraph_end, tail.paragraph_start, tail.paragraph_end,
         )
-        parts = [self._analyze(head, bible, repair_note=None), self._analyze(tail, bible, repair_note=None)]
+        first = self._analyze(head, bible, repair_note=None)
+        tail = tail.model_copy(update={"prior_speakers": carry_speakers(chunk.prior_speakers, head, first)})
+        parts = [first, self._analyze(tail, bible, repair_note=None)]
         return ChunkAnalysis(
             labels=[label for part in parts for label in part.labels],
             characters=[character for part in parts for character in part.characters],

@@ -21,6 +21,9 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=1,<2"]
 elevenlabs = ["elevenlabs>=2,<3"]
+# AudioGen sound effects need `audiocraft`, deliberately not an extra (it pins its own torch):
+# `pip install audiocraft` by hand, or local sfx degrades to the procedural synthesizer
+# (README: BOOKREADER_LOCAL_SFX_FALLBACK).
 local = ["piper-tts>=1.2", "transformers>=4.44", "torch>=2.2"]
 local-kokoro = ["kokoro>=0.9", "soundfile>=0.12"]
 pdf = ["pypdf>=4"]

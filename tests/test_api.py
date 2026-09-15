@@ -53,7 +53,7 @@ def test_status_done_with_every_stage_in_order(client: TestClient, job_id: str) 
     assert body["usage"]["calls"] > 0 and body["usage"]["cache_hits"] == 0
     assert [c["index"] for c in body["chapters"]] == [1, 2, 3]
     assert all(c["ready"] and c["duration_ms"] > 0 for c in body["chapters"])
-    assert body["providers"]["tts"] == {"family": "mock", "cache_version": "1"}
+    assert body["providers"]["tts"] == {"family": "mock", "cache_version": "1:4"}   # mock tts keys its pacing knob
     assert body["started_at"] and body["finished_at"]
 
 
@@ -108,11 +108,32 @@ def test_artifact_range_request(client: TestClient, job_id: str) -> None:
 
 
 def test_artifact_path_never_escapes(client: TestClient, job_id: str) -> None:
-    for path in ("../../bookreader.db", "..%2F..%2Fbookreader.db", "chapters/..%2F..%2F..%2Fbookreader.db", "/etc/passwd"):
+    for path in (
+        "../../bookreader.db", "..%2F..%2Fbookreader.db", "chapters/..%2F..%2F..%2Fbookreader.db", "/etc/passwd",
+        "foo%00bar", "chapters/01/mix.wav%00", "%00",               # an embedded NUL used to be a 500
+    ):
         response = client.get(f"/api/jobs/{job_id}/artifacts/{path}")
         assert response.status_code in (400, 404), path
         assert b"SQLite" not in response.content and b"root:" not in response.content
     assert client.get(f"/api/jobs/{job_id}/artifacts/does/not/exist.wav").status_code == 404
+
+
+def test_artifacts_hide_the_source_temp_files_and_symlinks(client: TestClient, job_id: str) -> None:
+    job_dir = client.app.state.settings.data_dir / "jobs" / job_id
+    assert (job_dir / "source.txt").is_file()
+    (job_dir / ".bible.json.123.tmp").write_text("{}", encoding="utf-8")
+    (job_dir / "evil.txt").symlink_to(job_dir.parent.parent / "bookreader.db")
+    try:
+        listed = {f["path"] for f in client.get(f"/api/jobs/{job_id}/artifacts").json()["files"]}
+        assert "manifest.json" in listed
+        assert not any(p.startswith("source.") or p.startswith(".") or p == "evil.txt" for p in listed)
+        for path in ("source.txt", ".bible.json.123.tmp", "evil.txt"):
+            response = client.get(f"/api/jobs/{job_id}/artifacts/{path}")
+            assert response.status_code in (400, 404), path
+            assert b"Chapter" not in response.content and b"SQLite" not in response.content
+    finally:
+        (job_dir / ".bible.json.123.tmp").unlink()
+        (job_dir / "evil.txt").unlink()
 
 
 # --------------------------------------------------------------------------- events, usage, log
@@ -127,6 +148,15 @@ def test_events_pagination(client: TestClient, job_id: str) -> None:
     assert any(m == "stage ingest started" for m in messages) and any(m.startswith("run finished") for m in messages)
     tail = client.get(f"/api/jobs/{job_id}/events", params={"after": rest["last_id"]}).json()
     assert tail == {"events": [], "last_id": rest["last_id"]}
+
+
+def test_events_and_log_reject_out_of_range_params(client: TestClient, job_id: str) -> None:
+    assert client.get(f"/api/jobs/{job_id}/events", params={"after": "99999999999999999999"}).status_code == 422
+    assert client.get(f"/api/jobs/{job_id}/events", params={"after": -1}).status_code == 422
+    assert client.get(f"/api/jobs/{job_id}/events", params={"limit": 0}).status_code == 422
+    assert client.get(f"/api/jobs/{job_id}/events", params={"limit": 5000}).status_code == 422
+    assert client.get(f"/api/jobs/{job_id}/log", params={"lines": 0}).status_code == 422
+    assert client.get(f"/api/jobs/{job_id}/events", params={"after": 2**63 - 1}).json() == {"events": [], "last_id": 2**63 - 1}
 
 
 def test_usage(client: TestClient, job_id: str) -> None:
@@ -182,6 +212,10 @@ def test_put_cast_recasts_only_that_character(client: TestClient, sample_book_pa
 
 
 def test_put_cast_rejects_unknown_voice_and_character(client: TestClient, job_id: str) -> None:
+    attempts_before = {s["stage"]: s["attempts"] for s in client.get(f"/api/jobs/{job_id}").json()["stages"]}
+    assert client.put(f"/api/jobs/{job_id}/cast", json={"overrides": {}}).status_code == 400      # nothing to re-cast
+    assert client.put(f"/api/jobs/{job_id}/cast", json={}).status_code == 400
+    assert {s["stage"]: s["attempts"] for s in client.get(f"/api/jobs/{job_id}").json()["stages"]} == attempts_before
     assert client.put(f"/api/jobs/{job_id}/cast", json={"overrides": {"Tobias": "no-such-voice"}}).status_code == 400
     assert client.put(f"/api/jobs/{job_id}/cast", json={"overrides": {"Nobody": "mock-m-teen"}}).status_code == 400
     assert client.put(f"/api/jobs/{job_id}/cast", json={"overrides": {"Tobias": "mock-m-teen"}, "extra": 1}).status_code == 422
@@ -205,6 +239,47 @@ def test_retry_from_finalize_rewrites_manifest(client: TestClient, sample_book_p
     stages = {s["stage"]: s for s in status["stages"]}
     assert stages["finalize"]["attempts"] == 2 and stages["render"]["attempts"] == 1
     assert client.get(f"/api/jobs/{job}/manifest").status_code == 200
+
+
+@pytest.mark.parametrize("from_stage", ["analyze", "cast"])
+def test_retry_from_analyze_or_cast_regenerates_outputs(client: TestClient, sample_book_path: Path, from_stage: str) -> None:
+    """A retry from analyze/cast must rewrite that stage's outputs, not keep them because they exist."""
+    job = _upload(client, sample_book_path)["job_id"]
+    job_dir = client.app.state.settings.data_dir / "jobs" / job
+    targets = [job_dir / "scripts" / "ch01.json", job_dir / "bible.json"] if from_stage == "analyze" else [job_dir / "cast.json"]
+    for path in targets:                                   # a stale/tampered output that a real re-run replaces
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["__marker__"] = True
+        path.write_text(json.dumps(doc), encoding="utf-8")
+    response = client.post(f"/api/jobs/{job}/retry", json={"from_stage": from_stage})
+    assert response.status_code == 202
+    status = client.get(f"/api/jobs/{job}").json()
+    assert status["status"] == "done", status["error"]
+    stages = {s["stage"]: s for s in status["stages"]}
+    assert stages[from_stage]["attempts"] == 2 and stages["render"]["attempts"] == 2 and stages["ingest"]["attempts"] == 1
+    for path in targets:
+        assert "__marker__" not in json.loads(path.read_text(encoding="utf-8"))
+    assert "scripts present" not in stages["analyze"]["message"] and "cast.json present" not in stages["cast"]["message"]
+    assert client.get(f"/api/jobs/{job}/usage").json()["cache_hits"] > 0     # the re-run was served from the cache
+
+
+def test_estimate_words_follow_the_chapter_subset(client: TestClient, sample_book_path: Path) -> None:
+    full = client.get(f"/api/jobs/{_upload(client, sample_book_path)['job_id']}").json()["estimate"]
+    subset = client.get(f"/api/jobs/{_upload(client, sample_book_path, options=json.dumps({'chapters': [1, 2]}))['job_id']}").json()["estimate"]
+    assert subset["chapters"] == 2 and 0 < subset["words"] < full["words"] == 618
+
+
+def test_bad_cast_override_option_is_repairable_with_put_cast(client: TestClient, sample_book_path: Path) -> None:
+    job = _upload(client, sample_book_path, options=json.dumps({"cast_overrides": {"Tobias": "no-such-voice"}}))["job_id"]
+    status = client.get(f"/api/jobs/{job}").json()
+    assert status["status"] == "failed" and status["error"]["stage"] == "cast" and status["error"]["error_type"] == "input"
+    assert client.get(f"/api/jobs/{job}/cast").status_code == 404
+    assert client.put(f"/api/jobs/{job}/cast", json={"overrides": {"Tobias": "no-such-voice"}}).status_code == 400
+    assert client.put(f"/api/jobs/{job}/cast", json={"overrides": {"Tobias": "mock-m-teen"}}).status_code == 202
+    status = client.get(f"/api/jobs/{job}").json()
+    assert status["status"] == "done", status["error"]
+    tobias = next(a for a in client.get(f"/api/jobs/{job}/cast").json()["cast"]["characters"] if a["character"] == "Tobias")
+    assert tobias["voice"]["id"] == "mock-m-teen" and tobias["source"] == "override"
 
 
 def test_delete_then_404(client: TestClient, sample_book_path: Path) -> None:
@@ -231,6 +306,28 @@ def test_upload_rejects_bad_options(client: TestClient, sample_book_path: Path) 
     with sample_book_path.open("rb") as fh:
         response = client.post("/api/jobs", files={"file": ("book.txt", fh, "text/plain")}, data={"options": json.dumps({"bogus": 1})})
     assert response.status_code == 400
+
+
+def test_upload_rejects_bad_chapter_numbers_and_normalizes_the_rest(client: TestClient, sample_book_path: Path) -> None:
+    for chapters in ([0], [-1], [1, 0]):
+        with sample_book_path.open("rb") as fh:
+            response = client.post("/api/jobs", files={"file": ("book.txt", fh, "text/plain")}, data={"options": json.dumps({"chapters": chapters})})
+        assert response.status_code == 400 and "chapters" in response.json()["detail"], chapters
+    body = _upload(client, sample_book_path, options=json.dumps({"chapters": [2, 2, 1]}))
+    status = client.get(f"/api/jobs/{body['job_id']}").json()
+    assert status["status"] == "done" and status["options"]["chapters"] == [1, 2]
+    body = _upload(client, sample_book_path, options=json.dumps({"chapters": []}))
+    assert client.get(f"/api/jobs/{body['job_id']}").json()["options"]["chapters"] is None
+
+
+def test_upload_with_a_very_long_filename(client: TestClient, sample_book_path: Path) -> None:
+    name = "x" * 300 + ".txt"                                  # over NAME_MAX: must not be used as a disk name
+    with sample_book_path.open("rb") as fh:
+        response = client.post("/api/jobs", files={"file": (name, fh, "text/plain")})
+    assert response.status_code == 202, response.text
+    status = client.get(f"/api/jobs/{response.json()['job_id']}").json()
+    assert status["status"] == "done" and status["filename"].endswith(".txt") and len(status["filename"]) <= 200
+    assert status["title"] == status["filename"][:-4]                # the default title is the (truncated) client name
 
 
 def test_upload_with_chapter_subset(client: TestClient, sample_book_path: Path) -> None:
@@ -265,6 +362,8 @@ def test_index_serves_html(client: TestClient) -> None:
     response = client.get("/")
     assert response.status_code == 200 and response.headers["content-type"].startswith("text/html")
     assert "bookreader" in response.text and "<script" in response.text
+    assert 'rel="icon"' in response.text
+    assert client.get("/favicon.ico").status_code == 204          # no 404 console error / access-log noise per page load
 
 
 def test_provider_config_error_aborts_startup(tmp_path: Path) -> None:

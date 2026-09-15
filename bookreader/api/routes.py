@@ -15,7 +15,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
@@ -76,6 +76,8 @@ MB = 1024 * 1024
 UPLOAD_CHUNK_BYTES = MB
 MAX_EVENT_LIMIT = 1000
 MAX_LOG_LINES = 10_000
+MAX_SQLITE_INT = 2**63 - 1
+MAX_FILENAME_CHARS = 200
 MEDIA_TYPES: dict[str, str] = {
     ".wav": "audio/wav",
     ".mp3": "audio/mpeg",
@@ -122,6 +124,19 @@ def _require_not_running(job: Job) -> None:
 
 def _paths(settings: Settings, job_id: str) -> JobPaths:
     return JobPaths(settings.data_dir, job_id)
+
+
+def _discard_from_queue(queue: JobQueue, job_id: str) -> None:
+    """Drop a waiting id from queue backends that support it (a cancelled or deleted job must not
+    be picked up by a worker later)."""
+    discard = getattr(queue, "discard", None)
+    if callable(discard):
+        discard(job_id)
+
+
+def _hidden_artifact(paths: JobPaths, path: Path) -> bool:
+    """The uploaded source and dot-files (atomic-write temp files, health probes) are not artifacts."""
+    return path.name.startswith(".") or (path.parent == paths.job_dir and path.stem == "source")
 
 
 # --------------------------------------------------------------------------- derived views
@@ -191,11 +206,11 @@ def _voices(paths: JobPaths) -> list[VoiceInfo]:
     return [VoiceInfo.model_validate(item) for item in read_json(paths.voices)]
 
 
-def _known_character(name: str, cast: Cast, bible: CastBible | None) -> bool:
+def _known_character(name: str, cast: Cast | None, bible: CastBible | None) -> bool:
     key = normalize_name(name)
     if key == NARRATOR.lower():
         return True
-    if any(normalize_name(assignment.character) == key for assignment in cast.characters):
+    if cast is not None and any(normalize_name(assignment.character) == key for assignment in cast.characters):
         return True
     return bible is not None and bible.find(name) is not None
 
@@ -211,6 +226,17 @@ def _clear_render_outputs(paths: JobPaths) -> None:
                 if entry.is_file() and entry.name != "tts.json":
                     entry.unlink()
     paths.manifest.unlink(missing_ok=True)
+
+
+def _normalized_options(options: JobOptions) -> JobOptions:
+    """Reject chapter numbers below 1 (400 at upload rather than an input error minutes later);
+    duplicates are dropped, an empty list means every chapter."""
+    if options.chapters is None:
+        return options
+    bad = [n for n in options.chapters if n < 1]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"invalid options: chapters must be >= 1, got {bad[0]}")
+    return options.model_copy(update={"chapters": sorted(set(options.chapters)) or None})
 
 
 def _media_type(path: Path) -> str:
@@ -231,15 +257,18 @@ async def submit_job(
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
         raise HTTPException(status_code=415, detail=f"unsupported file type {suffix or filename!r}; supported: {', '.join(SUPPORTED_SUFFIXES)}")
+    if len(filename) > MAX_FILENAME_CHARS:           # keep the display name sane; the disk name never uses it
+        filename = filename[: MAX_FILENAME_CHARS - len(suffix)].rstrip() + suffix
     job_options = JobOptions()
     if options:
         try:
             job_options = JobOptions.model_validate_json(options)
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=f"invalid options: {exc.errors()[0]['msg']}") from exc
+        job_options = _normalized_options(job_options)
     limit = d.settings.max_upload_mb * MB
     with tempfile.TemporaryDirectory(prefix="bookreader-upload-") as tmp:
-        target = Path(tmp) / filename
+        target = Path(tmp) / f"upload{suffix}"         # create_job only needs the suffix; a 300-char client name would not open
         received = 0
         with target.open("wb") as fh:
             while True:
@@ -250,7 +279,7 @@ async def submit_job(
                 if received > limit:
                     raise HTTPException(status_code=413, detail=f"upload exceeds {d.settings.max_upload_mb} MB (BOOKREADER_MAX_UPLOAD_MB)")
                 fh.write(chunk)
-        job = await run_in_threadpool(create_job, d.store, d.settings, target, (title or "").strip() or None, job_options)
+        job = await run_in_threadpool(create_job, d.store, d.settings, target, (title or "").strip() or None, job_options, filename=filename)
     log.info("job %s created from %s (%d bytes)", job.id, filename, received)
     await run_in_threadpool(d.queue.submit, job.id)
     return JobCreated(job_id=job.id, status=job.status.value, status_url=f"{_root(request)}/api/jobs/{job.id}")
@@ -276,21 +305,26 @@ def job_status(job_id: str, d: ApiDeps = Depends(deps)) -> JobStatusOut:
 
 
 @router.get("/jobs/{job_id}/events", response_model=EventsOut)
-def job_events(job_id: str, after: int = 0, limit: int = 200, d: ApiDeps = Depends(deps)) -> EventsOut:
+def job_events(
+    job_id: str,
+    after: int = Query(0, ge=0, le=MAX_SQLITE_INT),
+    limit: int = Query(200, ge=1, le=MAX_EVENT_LIMIT),
+    d: ApiDeps = Depends(deps),
+) -> EventsOut:
     """Events with ids greater than *after* (oldest first); poll with ``after=last_id``."""
     _load_job(d.store, job_id)
-    events = d.store.events_after(job_id, max(0, after), max(1, min(limit, MAX_EVENT_LIMIT)))
-    return EventsOut(events=events, last_id=events[-1].id if events else max(0, after))
+    events = d.store.events_after(job_id, after, limit)
+    return EventsOut(events=events, last_id=events[-1].id if events else after)
 
 
 @router.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
-def job_log(job_id: str, lines: int = 500, d: ApiDeps = Depends(deps)) -> PlainTextResponse:
+def job_log(job_id: str, lines: int = Query(500, ge=1, le=MAX_LOG_LINES), d: ApiDeps = Depends(deps)) -> PlainTextResponse:
     """The last *lines* lines of ``job.log`` (empty until the job has started)."""
     _load_job(d.store, job_id)
     path = _paths(d.settings, job_id).log
     if not path.is_file():
         return PlainTextResponse("")
-    tail: deque[str] = deque(maxlen=max(1, min(lines, MAX_LOG_LINES)))
+    tail: deque[str] = deque(maxlen=lines)
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         tail.extend(fh)
     return PlainTextResponse("".join(tail))
@@ -312,11 +346,15 @@ def update_cast(job_id: str, body: CastUpdate, d: ApiDeps = Depends(deps)) -> Jo
     """Pin voices by character name and re-run cast/render/finalize (only changed voices re-synthesize)."""
     job = _load_job(d.store, job_id)
     _require_not_running(job)
+    if not body.overrides:
+        raise HTTPException(status_code=400, detail="overrides must name at least one character")
     paths = _paths(d.settings, job_id)
-    if not paths.cast.is_file():
+    # voices.json and bible.json exist as soon as the cast stage fetched the catalog, so a job whose
+    # cast failed on a bad options.cast_overrides entry can still be repaired here (no cast.json yet).
+    if not (paths.voices.is_file() and paths.bible.is_file()):
         raise HTTPException(status_code=404, detail="cast not available yet; wait for the cast stage")
-    cast = Cast.model_validate(read_json(paths.cast))
-    bible = CastBible.model_validate(read_json(paths.bible)) if paths.bible.is_file() else None
+    cast = Cast.model_validate(read_json(paths.cast)) if paths.cast.is_file() else None
+    bible = CastBible.model_validate(read_json(paths.bible))
     voice_ids = {voice.id for voice in _voices(paths)}
     for name, voice_id in body.overrides.items():
         if not _known_character(name, cast, bible):
@@ -330,12 +368,18 @@ def update_cast(job_id: str, body: CastUpdate, d: ApiDeps = Depends(deps)) -> Jo
             merged.update({str(k): str(v) for k, v in stored.items()})
     merged.update(body.overrides)
     write_json(paths.cast_overrides, merged)
-    if job.status == JobStatus.queued:            # not started yet: the cast stage will pick the file up
-        return JobAction(job_id=job_id, status=job.status.value)
+    # A queued job is already in the queue (retry / boot-time resubmit / waiting behind other jobs),
+    # so it is not submitted again; but its cast stage row may already be done (retry from render
+    # or finalize, orphan requeue), in which case the worker would skip stage_cast and never read
+    # the overrides. Resetting the rows from cast onward makes the pending run honour the pin.
     _clear_render_outputs(paths)
-    d.store.requeue(job_id, from_stage=Stage.cast)
+    if job.status == JobStatus.queued:
+        d.store.reset_stages_from(job_id, Stage.cast)
+    else:
+        d.store.requeue(job_id, from_stage=Stage.cast)
     d.store.append_event(job_id, "info", Stage.cast.value, f"re-cast requested: {', '.join(f'{k} -> {v}' for k, v in body.overrides.items())}")
-    d.queue.submit(job_id)
+    if job.status != JobStatus.queued:
+        d.queue.submit(job_id)
     return JobAction(job_id=job_id, status=(d.store.get_job(job_id) or job).status.value)
 
 
@@ -378,11 +422,9 @@ def list_artifacts(job_id: str, request: Request, d: ApiDeps = Depends(deps)) ->
     files: list[ArtifactFile] = []
     if paths.job_dir.is_dir():
         for path in sorted(paths.job_dir.rglob("*")):
-            if not path.is_file() or path.name.startswith("."):
+            if path.is_symlink() or not path.is_file() or _hidden_artifact(paths, path):
                 continue
             rel = paths.relative(path)
-            if path.parent == paths.job_dir and path.stem == "source":
-                continue
             files.append(ArtifactFile(path=rel, bytes=path.stat().st_size, url=f"{_root(request)}/api/jobs/{job_id}/artifacts/{rel}"))
     return ArtifactList(files=files)
 
@@ -392,11 +434,14 @@ def get_artifact(job_id: str, path: str, d: ApiDeps = Depends(deps)) -> FileResp
     """Serve one artifact with Range support (so ``<audio>`` can seek); 400 if the path escapes the job dir."""
     _load_job(d.store, job_id)
     paths = _paths(d.settings, job_id)
-    job_dir = paths.job_dir.resolve()
-    target = (paths.job_dir / path).resolve()
+    try:
+        job_dir = paths.job_dir.resolve()
+        target = (paths.job_dir / path).resolve()
+    except (ValueError, OSError) as exc:                 # e.g. an embedded NUL byte from %00
+        raise HTTPException(status_code=400, detail="invalid artifact path") from exc
     if target != job_dir and job_dir not in target.parents:
         raise HTTPException(status_code=400, detail="artifact path escapes the job directory")
-    if not target.is_file():
+    if not target.is_file() or _hidden_artifact(paths, target):
         raise HTTPException(status_code=404, detail=f"no artifact {path!r}")
     return FileResponse(target, media_type=_media_type(target))
 
@@ -427,6 +472,7 @@ def cancel_job(job_id: str, d: ApiDeps = Depends(deps)) -> JobAction:
         raise HTTPException(status_code=409, detail=f"job {job_id} is already {job.status.value}")
     d.store.request_cancel(job_id)
     if job.status == JobStatus.queued:
+        _discard_from_queue(d.queue, job_id)
         error = JobError(stage="queued", error_type="cancelled", message="cancelled while queued", retryable=True)
         d.store.set_status(job_id, JobStatus.cancelled, error=error)
         d.store.append_event(job_id, "warn", None, "cancelled while queued")
@@ -438,6 +484,7 @@ def delete_job(job_id: str, d: ApiDeps = Depends(deps)) -> None:
     """Remove the rows and the job directory (the shared cache is untouched). 409 if running."""
     job = _load_job(d.store, job_id)
     _require_not_running(job)
+    _discard_from_queue(d.queue, job_id)
     d.store.delete_job(job_id)
     shutil.rmtree(_paths(d.settings, job_id).job_dir, ignore_errors=True)
     log.info("job %s deleted", job_id)

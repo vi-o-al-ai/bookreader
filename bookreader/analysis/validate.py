@@ -1,7 +1,8 @@
 """bookreader.analysis.validate - repair or reject one analyzer output for one chunk.
 
-Repairs (each one is reported as a warning): labels for unknown or duplicate span ids are
-dropped, quote spans without a label are labelled by the heuristic analyzer, speakers are
+Repairs (each one is reported as a warning): labels for unknown, duplicate or narration span
+ids are dropped (narration is always the narrator, spoken neutrally), quote spans without a
+label are labelled by the heuristic analyzer, speakers are
 coerced to canonical names through the bible and this chunk's character updates, SFX durations
 are clamped to 0.5..30 s and intensities/energies to 0..1. Two problems cannot be repaired and
 raise :class:`AnalysisInvalid`: more than 20 % of the quote spans unlabelled, or a cue that
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import logging
 
+from bookreader.analysis.bible import resolve_descriptor
 from bookreader.providers.mock.analysis import HeuristicAnalyzer
 from bookreader.types import NARRATOR, CastBible, CharacterUpdate, Chunk, ChunkAnalysis, MusicCueRaw, SfxCueRaw, SpanLabel, normalize_name
 
@@ -35,7 +37,7 @@ def canonical_speaker(speaker: str, bible: CastBible, updates: list[CharacterUpd
     key = normalize_name(speaker)
     if not key or key == NARRATOR.lower():
         return NARRATOR
-    entry = bible.find(speaker)
+    entry = bible.find(speaker) or resolve_descriptor(bible, speaker)
     if entry is not None:
         return entry.name
     for update in updates:
@@ -50,12 +52,15 @@ def validate_chunk_analysis(analysis: ChunkAnalysis, chunk: Chunk, bible: CastBi
     known = {span.id for span in chunk.spans}
     order = {span.id: index for index, span in enumerate(chunk.spans)}
     quote_ids = [span.id for span in chunk.spans if span.kind == "quote"]
+    narration_ids = known - set(quote_ids)
     warnings: list[str] = []
 
     labels: dict[str, SpanLabel] = {}
     for label in analysis.labels:
         if label.span_id not in known:
             warnings.append(f"dropped label for unknown span {label.span_id}")
+        elif label.span_id in narration_ids:
+            warnings.append(f"dropped label for narration span {label.span_id} (narration is always spoken plainly by {NARRATOR})")
         elif label.span_id in labels:
             warnings.append(f"dropped duplicate label for span {label.span_id}")
         else:

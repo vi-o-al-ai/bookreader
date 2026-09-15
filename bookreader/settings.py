@@ -25,6 +25,8 @@ DEFAULT_PRICES: dict[str, float] = {
     "elevenlabs:audio_seconds": 0.0,
 }
 
+LOG_LEVELS: tuple[str, ...] = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")   # the names logging and uvicorn share
+
 CHOICES: dict[str, tuple[str, ...]] = {
     "worker_mode": ("thread", "inline"),
     "anthropic_effort": ("low", "medium", "high", "xhigh", "max"),
@@ -36,6 +38,7 @@ CHOICES: dict[str, tuple[str, ...]] = {
 # Provider families, paths, concurrency and secrets always come from the current process.
 JOB_SNAPSHOT_FIELDS: tuple[str, ...] = (
     "analysis_chunk_chars",
+    "mock_ms_per_char",
     "music_gain_db",
     "sfx_gain_db",
     "mp3",
@@ -190,6 +193,8 @@ class Settings:
                 raise ValueError(f"{ENV_PREFIX}{name.upper()}: must be >= 0")
         if not 0.0 <= self.elevenlabs_sfx_prompt_influence <= 1.0:
             raise ValueError(f"{ENV_PREFIX}ELEVENLABS_SFX_PROMPT_INFLUENCE: must be between 0 and 1")
+        if self.log_level.upper() not in LOG_LEVELS:
+            raise ValueError(f"{ENV_PREFIX}LOG_LEVEL: expected one of {', '.join(LOG_LEVELS)}, got {self.log_level!r}")
 
     def with_overrides(self, **kw: Any) -> "Settings":
         """Return a copy with the given fields replaced (values already typed). Validates."""

@@ -1,10 +1,14 @@
 """bookreader.pipeline.stages - the five stage functions: ingest, analyze, cast, render, finalize.
 
 Every stage is idempotent and resumable: it skips work whose outputs already exist in the job
-directory, and inside a stage every provider call goes through the content-addressed cache, so a
-retried job only pays for what it has not produced yet. Stages raise typed errors with ``unit``
+directory (unless the stage is *forced* -- an explicit retry from that stage, see
+``JobContext.forced``), and inside a stage every provider call goes through the content-addressed
+cache, so a retried job only pays for what it has not produced yet. Stages raise typed errors with ``unit``
 set to the failing work item (``ch02:c2p7s1``, ``ch01:chunk0``, ``ch03:c3m001``) and call
-``ctx.check_cancelled()`` between units of work.
+``ctx.check_cancelled()`` between units of work. Per-family concurrency is owned by the adapters
+(the network families acquire ``bookreader.retry.FamilyLimiter`` around each request) and is never
+acquired here: the stages only fan out over ``settings.concurrency`` workers and retry transient
+errors with :func:`bookreader.retry.with_retry` so the job log shows every retry.
 """
 from __future__ import annotations
 
@@ -14,11 +18,12 @@ import logging
 import re
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Callable, Iterable, TypeVar
 
 from bookreader.analysis.assemble import assemble_script
 from bookreader.analysis.bible import apply_updates, finalize, register_speaker
-from bookreader.analysis.chunker import make_chunks
+from bookreader.analysis.chunker import carry_speakers, make_chunks
 from bookreader.analysis.validate import validate_chunk_analysis
 from bookreader.audio.dsp import normalize_rms, trim_silence
 from bookreader.audio.export import export_mp3
@@ -27,10 +32,11 @@ from bookreader.audio.pcm import to_canonical, to_int16
 from bookreader.audio.timeline import TimelineParams, build_timeline
 from bookreader.casting import cast_voices, settings_for
 from bookreader.ingest import load_book
+from bookreader.ingest.chapters import word_count
 from bookreader.jobs.paths import read_json, write_json
 from bookreader.manifest import build_job_manifest
 from bookreader.pipeline.context import JobContext
-from bookreader.retry import FamilyLimiter, with_retry
+from bookreader.retry import with_retry
 from bookreader.types import (
     NARRATOR,
     SAMPLE_RATE,
@@ -48,7 +54,9 @@ from bookreader.types import (
     ChunkAnalysis,
     Estimate,
     InputError,
+    JobStatus,
     Mood,
+    MusicJob,
     SfxJob,
     Stage,
     TTSRequest,
@@ -169,7 +177,7 @@ def _run_parallel(
 def stage_ingest(ctx: JobContext) -> None:
     """Load the uploaded file into ``book.json`` and write the pre-flight ``estimate.json``."""
     paths = ctx.paths
-    if paths.book.is_file():
+    if paths.book.is_file() and not ctx.is_forced():
         ctx.log("info", "ingest: book.json exists; skipped")
         ctx.progress("ingest", 1, 1, "book.json present")
         return
@@ -184,6 +192,7 @@ def stage_ingest(ctx: JobContext) -> None:
         book.chapters = [chapter for chapter in book.chapters if chapter.index in keep]
         if not book.chapters:
             raise InputError(f"options.chapters {sorted(keep)} selects no chapter of the {len(keep)} requested")
+        book.word_count = sum(word_count(paragraph.text) for chapter in book.chapters for paragraph in chapter.paragraphs)
     span_count = sum(len(chapter.spans) for chapter in book.chapters)
     if ctx.settings.max_segments and span_count > ctx.settings.max_segments:
         raise InputError(f"book has {span_count} spans; the limit is {ctx.settings.max_segments} (BOOKREADER_MAX_SEGMENTS)")
@@ -234,8 +243,7 @@ def _analyze_chunk(ctx: JobContext, chunk: Chunk, bible: CastBible) -> ChunkAnal
     if cached is not None:
         ctx.ledger.record("analysis", analyzer.family, "calls", 1.0, cache_hit=True, meta={"chapter": chunk.chapter_index, "chunk": chunk.chunk_index})
         return ChunkAnalysis.model_validate(cached)
-    with FamilyLimiter.acquire(analyzer.family, ctx.settings.concurrency):
-        raw = analyzer.analyze_chunk(chunk, bible)
+    raw = analyzer.analyze_chunk(chunk, bible)
     analysis, warnings = validate_chunk_analysis(raw, chunk, bible)
     for warning in warnings:
         ctx.log("warn", f"{_unit(chunk.chapter_index, f'chunk{chunk.chunk_index}')}: {warning}")
@@ -254,7 +262,7 @@ def stage_analyze(ctx: JobContext) -> None:
     """Label every chunk in book order, thread the cast bible through, assemble chapter scripts."""
     paths = ctx.paths
     book = _load_book(ctx)
-    if paths.bible.is_file() and all(paths.script(chapter.index).is_file() for chapter in book.chapters):
+    if not ctx.is_forced() and paths.bible.is_file() and all(paths.script(chapter.index).is_file() for chapter in book.chapters):
         ctx.log("info", "analyze: bible.json and every script exist; skipped")
         ctx.progress("analyze", 1, 1, "scripts present")
         return
@@ -269,9 +277,10 @@ def stage_analyze(ctx: JobContext) -> None:
     ctx.progress("analyze", 0, total, f"chunk 0/{total}")
     for chapter in book.chapters:
         chapter_moods[chapter.index] = mood
+        speakers: list[str] = []            # conversation continuity across the chapter's chunks
         for chunk in chunks_by_chapter[chapter.index]:
             ctx.check_cancelled()
-            chunk = chunk.model_copy(update={"prior_mood": mood})
+            chunk = chunk.model_copy(update={"prior_mood": mood, "prior_speakers": speakers})
             unit = _unit(chapter.index, f"chunk{chunk.chunk_index}")
             try:
                 analysis = _analyze_chunk(ctx, chunk, bible)
@@ -284,6 +293,7 @@ def stage_analyze(ctx: JobContext) -> None:
                 if label.span_id in quote_ids and label.speaker != NARRATOR:
                     bible, _ = register_speaker(bible, label.speaker, chapter.index)
             mood = _last_mood(analysis, mood)
+            speakers = carry_speakers(speakers, chunk, analysis)
             analyses[chapter.index].append(analysis)
             write_json(paths.bible, bible)
             done += 1
@@ -308,8 +318,7 @@ def _voice_catalog(ctx: JobContext) -> list[VoiceInfo]:
     cached = ctx.cache.get_json("voices", key, max_age_s=VOICE_CATALOG_TTL_S)
     if isinstance(cached, list) and cached:
         return [VoiceInfo.model_validate(item) for item in cached]
-    with FamilyLimiter.acquire(tts.family, ctx.settings.concurrency):
-        voices = with_retry(tts.list_voices, on_retry=_retry_logger(ctx, "cast:list_voices"))[: ctx.settings.max_voices]
+    voices = with_retry(tts.list_voices, on_retry=_retry_logger(ctx, "cast:list_voices"))[: ctx.settings.max_voices]
     if not voices:
         raise InputError(f"tts provider '{tts.family}' returned no voices")
     ctx.cache.put_json("voices", key, [voice.model_dump(mode="json") for voice in voices])
@@ -330,13 +339,48 @@ def co_speech_matrix(scripts: Iterable[ChapterScript]) -> dict[str, set[str]]:
     return dict(matrix)
 
 
+def _stale_cast_reason(ctx: JobContext, voices: list[VoiceInfo] | None = None) -> str | None:
+    """Why the existing ``cast.json`` can no longer be used with the current TTS provider (or
+    None when it can): a different provider family, or an assigned voice id the current catalog
+    does not offer (voices removed, cache_version or piper voices dir changed, ...)."""
+    tts = ctx.providers.tts
+    try:
+        cast = _load_cast(ctx)
+    except (OSError, ValueError) as exc:
+        return f"cast.json is unreadable ({exc})"
+    if cast.family != tts.family:
+        return f"cast.json was cast for family {cast.family!r}, the current tts family is {tts.family!r}"
+    known = {voice.id for voice in (voices if voices is not None else _voice_catalog(ctx))}
+    assigned = [cast.narrator.voice.id] + [assignment.voice.id for assignment in cast.characters]
+    missing = sorted({voice_id for voice_id in assigned if voice_id not in known})
+    if missing:
+        return f"voice id(s) {', '.join(missing)} are not in the current {tts.family!r} catalog"
+    return None
+
+
 def stage_cast(ctx: JobContext) -> None:
-    """Assign voices to the narrator and every speaking character; write ``cast.json``."""
+    """Assign voices to the narrator and every speaking character; write ``cast.json``.
+
+    An existing cast is reused unless the stage is forced (retry from cast), ``cast_overrides.json``
+    is newer (PUT /cast) or the cast no longer fits the current TTS provider (family switched,
+    voice gone from the catalog).
+    """
     paths = ctx.paths
-    if paths.cast.is_file() and not (paths.cast_overrides.is_file() and paths.cast_overrides.stat().st_mtime >= paths.cast.stat().st_mtime):
-        ctx.log("info", "cast: cast.json exists; skipped")
-        ctx.progress("cast", 1, 1, "cast.json present")
-        return
+    if paths.cast.is_file():
+        reason = _stale_cast_reason(ctx)
+        overrides_newer = paths.cast_overrides.is_file() and paths.cast_overrides.stat().st_mtime >= paths.cast.stat().st_mtime
+        if reason is not None:
+            ctx.log("warn", f"cast: {reason}; re-casting")
+        elif not ctx.is_forced() and not overrides_newer:
+            ctx.log("info", "cast: cast.json exists; skipped")
+            ctx.progress("cast", 1, 1, "cast.json present")
+            return
+    _cast(ctx)
+
+
+def _cast(ctx: JobContext) -> None:
+    """Fetch the catalog, merge the overrides, score and write ``cast.json`` (+ ``voices.json``)."""
+    paths = ctx.paths
     book = _load_book(ctx)
     bible = CastBible.model_validate(read_json(paths.bible))
     voices = _voice_catalog(ctx)
@@ -356,6 +400,37 @@ def stage_cast(ctx: JobContext) -> None:
     write_json(paths.cast, cast)
     ctx.log("info", "cast: narrator " + cast.narrator.voice.id + "; " + ", ".join(f"{a.character} -> {a.voice.id}" for a in cast.characters))
     ctx.progress("cast", 1, 1, f"{len(cast.characters)} characters cast")
+
+
+# --------------------------------------------------------------------------- render: provider calls
+def _synthesize(ctx: JobContext, chapter_index: int, job: TtsJob) -> AudioClip:
+    """One TTS call (retried), finished and stored in the cache; returns the finished clip."""
+    tts = ctx.providers.tts
+    clip = with_retry(lambda: tts.synthesize(job.request), on_retry=_retry_logger(ctx, _unit(chapter_index, job.segment_id)))
+    finished = _finish_clip(clip, trim=True)
+    ctx.cache.put("tts", job.clip_key, finished)
+    ctx.mark_produced("tts", job.clip_key)
+    return finished
+
+
+def _compose(ctx: JobContext, chapter_index: int, job: MusicJob) -> AudioClip:
+    """One music call (retried), finished and stored in the cache; returns the finished clip."""
+    music = ctx.providers.music
+    clip = with_retry(lambda: music.compose(job.request), on_retry=_retry_logger(ctx, _unit(chapter_index, job.cue_id)))
+    finished = _finish_clip(clip, trim=False)
+    ctx.cache.put("music", job.clip_key, finished)
+    ctx.mark_produced("music", job.clip_key)
+    return finished
+
+
+def _generate(ctx: JobContext, chapter_index: int, job: SfxJob) -> AudioClip:
+    """One sfx call (retried), finished and stored in the cache; returns the finished clip."""
+    sfx = ctx.providers.sfx
+    clip = with_retry(lambda: sfx.generate(job.request), on_retry=_retry_logger(ctx, _unit(chapter_index, job.cue_id)))
+    finished = _finish_clip(clip, trim=False)
+    ctx.cache.put("sfx", job.clip_key, finished)
+    ctx.mark_produced("sfx", job.clip_key)
+    return finished
 
 
 # --------------------------------------------------------------------------- render: tts
@@ -457,12 +532,7 @@ def _render_tts(ctx: JobContext, script: ChapterScript, cast: Cast, chapter_no: 
     ctx.progress("tts", chapter_no - 1, chapter_count, f"{label} {total - len(misses)}/{total}")
 
     def synthesize(job: TtsJob) -> int:
-        with FamilyLimiter.acquire(tts.family, ctx.settings.concurrency):
-            clip = with_retry(lambda: tts.synthesize(job.request), on_retry=_retry_logger(ctx, _unit(index, job.segment_id)))
-        finished = _finish_clip(clip, trim=True)
-        ctx.cache.put("tts", job.clip_key, finished)
-        ctx.mark_produced("tts", job.clip_key)
-        return finished.duration_ms
+        return _synthesize(ctx, index, job).duration_ms
 
     completed = total - len(misses)
 
@@ -528,14 +598,10 @@ def _render_music(ctx: JobContext, timeline: ChapterTimeline, chapter_no: int, c
         if ctx.cache.has("music", job.clip_key):
             _record_hit(ctx, "music", job.clip_key, music.family, "audio_seconds", seconds, {"cue": job.cue_id})
         else:
-            unit = _unit(index, job.cue_id)
             try:
-                with FamilyLimiter.acquire(music.family, ctx.settings.concurrency):
-                    clip = with_retry(lambda: music.compose(job.request), on_retry=_retry_logger(ctx, unit))
-                ctx.cache.put("music", job.clip_key, _finish_clip(clip, trim=False))
-                ctx.mark_produced("music", job.clip_key)
+                _compose(ctx, index, job)
             except BaseException as exc:
-                _attach_unit(exc, unit)
+                _attach_unit(exc, _unit(index, job.cue_id))
                 raise
         ctx.progress("music", chapter_no - 1, chapter_count, f"{label} {position + 1}/{len(jobs)}")
     ctx.progress("music", chapter_no - 1, chapter_count, f"{label} {len(jobs)}/{len(jobs)}")
@@ -557,10 +623,7 @@ def _render_sfx(ctx: JobContext, timeline: ChapterTimeline, chapter_no: int, cha
     ctx.progress("sfx", chapter_no - 1, chapter_count, f"{label} {completed}/{len(jobs)}")
 
     def generate(job: SfxJob) -> None:
-        with FamilyLimiter.acquire(sfx.family, ctx.settings.concurrency):
-            clip = with_retry(lambda: sfx.generate(job.request), on_retry=_retry_logger(ctx, _unit(index, job.cue_id)))
-        ctx.cache.put("sfx", job.clip_key, _finish_clip(clip, trim=False))
-        ctx.mark_produced("sfx", job.clip_key)
+        _generate(ctx, index, job)
 
     def record(job: SfxJob, _: None) -> None:
         nonlocal completed
@@ -570,17 +633,38 @@ def _render_sfx(ctx: JobContext, timeline: ChapterTimeline, chapter_no: int, cha
     _run_parallel(ctx, misses, generate, lambda job: _unit(index, job.cue_id), record)
 
 
-def _mix_chapter(ctx: JobContext, script: ChapterScript, cast: Cast, timeline: ChapterTimeline, key: str) -> ChapterManifest:
-    """Mix the chapter, export mp3 when allowed, write ``manifest.json`` and the render key sidecar."""
+def _mix_chapter(
+    ctx: JobContext, script: ChapterScript, cast: Cast, tts: ChapterTts, timeline: ChapterTimeline, key: str,
+) -> ChapterManifest:
+    """Mix the chapter, export mp3 when allowed, write ``manifest.json`` and the render key sidecar.
+
+    A clip that vanished from the shared cache between the substages (another job's finalize
+    pruned it) is regenerated on the spot from its recorded request instead of failing the job.
+    """
     paths = ctx.paths
     index = script.chapter_index
     kinds = {placement.clip_key: TRACK_KIND[placement.track] for placement in timeline.placements}
+    regenerate: dict[str, Callable[[], AudioClip]] = {}
+    for tts_job in tts.jobs:
+        regenerate.setdefault(tts_job.clip_key, lambda job=tts_job: _synthesize(ctx, index, job))
+    for music_job in timeline.music_jobs:
+        regenerate.setdefault(music_job.clip_key, lambda job=music_job: _compose(ctx, index, job))
+    for sfx_job in timeline.sfx_jobs:
+        regenerate.setdefault(sfx_job.clip_key, lambda job=sfx_job: _generate(ctx, index, job))
 
     def load_clip(clip_key_: str) -> AudioClip:
-        clip = ctx.cache.get(kinds[clip_key_], clip_key_)
-        if clip is None:
-            raise RenderError(f"clip {clip_key_} missing from the {kinds[clip_key_]} cache", unit=_unit(index, "mix"))
-        return clip
+        kind = kinds[clip_key_]
+        clip = ctx.cache.get(kind, clip_key_)
+        if clip is not None:
+            return clip
+        if clip_key_ not in regenerate:
+            raise RenderError(f"clip {clip_key_} missing from the {kind} cache", unit=_unit(index, "mix"))
+        ctx.log("warn", f"{_unit(index, 'mix')}: {kind} clip {clip_key_[:12]} was evicted from the cache; regenerating")
+        try:
+            return regenerate[clip_key_]()
+        except BaseException as exc:
+            _attach_unit(exc, _unit(index, "mix"))
+            raise
 
     out_dir = paths.chapter_dir(index)
     written = mix_chapter(timeline, load_clip, out_dir)
@@ -598,6 +682,10 @@ def stage_render(ctx: JobContext) -> None:
     """Per chapter in order: tts -> timeline -> music -> sfx -> mix (+ chapter manifest)."""
     paths = ctx.paths
     book = _load_book(ctx)
+    reason = _stale_cast_reason(ctx)          # the cast stage was skipped as done, but the TTS provider may have changed since
+    if reason is not None:
+        ctx.log("warn", f"render: {reason}; re-casting before rendering")
+        _cast(ctx)
     cast = _load_cast(ctx)
     params = timeline_params(ctx)
     chapter_count = len(book.chapters)
@@ -631,12 +719,33 @@ def stage_render(ctx: JobContext) -> None:
         ctx.check_cancelled(force=True)
         with ctx.substage(f"ch{index:02d} mix"):
             ctx.progress("mix", chapter_no - 1, chapter_count, f"ch {chapter_no}/{chapter_count} mix")
-            manifest = _mix_chapter(ctx, script, cast, timeline, key)
+            manifest = _mix_chapter(ctx, script, cast, tts, timeline, key)
         ctx.log("info", f"chapter {chapter_no}/{chapter_count} mixed: {manifest.duration_ms} ms -> {manifest.files['mix']}")
         ctx.progress("chapter", chapter_no, chapter_count, f"ch {chapter_no}/{chapter_count} done")
 
 
 # --------------------------------------------------------------------------- finalize
+def _running_jobs_floor(ctx: JobContext) -> float | None:
+    """Start time (``time.time()`` stamp) of the oldest *other* job still running, or None.
+
+    Cache entries used since then belong to a job in flight (every hit touches the file), so
+    the prune spares them; without a concurrent job the cap is enforced strictly.
+    """
+    floor: float | None = None
+    for other in ctx.store.list_jobs(limit=1000):
+        if other.id == ctx.job.id or other.status != JobStatus.running or not other.started_at:
+            continue
+        try:
+            started = datetime.fromisoformat(other.started_at)
+        except ValueError:
+            continue
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        stamp = started.timestamp()
+        floor = stamp if floor is None else min(floor, stamp)
+    return floor
+
+
 def stage_finalize(ctx: JobContext) -> None:
     """Write ``usage.json`` and ``manifest.json`` (last), then prune the shared cache."""
     ctx.check_cancelled(force=True)
@@ -651,7 +760,7 @@ def stage_finalize(ctx: JobContext) -> None:
     ctx.ledger.write_json(paths.usage)
     manifest = build_job_manifest(job, book, manifests, ctx.providers.describe(), warnings)
     write_json(paths.manifest, manifest)
-    removed = ctx.cache.prune(ctx.settings.cache_max_mb * MB)
+    removed = ctx.cache.prune(ctx.settings.cache_max_mb * MB, keep_newer_than=_running_jobs_floor(ctx))
     if removed:
         ctx.log("info", f"finalize: pruned {len(removed)} cache file(s) to stay under {ctx.settings.cache_max_mb} MB")
     ctx.log("info", f"finalize: manifest.json written ({len(manifests)} chapter(s), {manifest.total_duration_ms} ms)")

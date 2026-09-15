@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from bookreader.analysis.chunker import make_chunks
+from bookreader.analysis.chunker import carry_speakers, make_chunks
 from bookreader.ingest import load_book
-from bookreader.types import Book, Chapter, Paragraph, Span
+from bookreader.types import NARRATOR, Book, Chapter, ChunkAnalysis, Paragraph, Span, SpanLabel
 
 
 def _chapter(lengths: list[int], index: int = 1, scene_breaks: set[int] = frozenset()) -> Chapter:
@@ -169,3 +169,21 @@ def test_scene_break_paragraphs_come_from_ingest_flags(tmp_path: Path) -> None:
     assert [p.scene_break_before for p in chapter.paragraphs] == [False, False, True, False, True]
     assert [c.scene_break_paragraphs for c in make_chunks(chapter, 6000)] == [[3, 5]]
     assert [c.scene_break_paragraphs for c in make_chunks(chapter, 200)] == [[], [3], [5]]
+
+
+# --------------------------------------------------------------------------- prior speakers
+def test_carry_speakers_keeps_the_last_two_distinct_dialogue_speakers() -> None:
+    def quote(n: int) -> Span:
+        return Span(id=f"c1p{n}s0", kind="quote", text=f"line {n}", start_char=1, end_char=7)
+
+    chunk = make_chunks(Chapter(index=1, title="Chapter 1", paragraphs=[
+        Paragraph(index=n, text=f'"line {n}"', spans=[quote(n)]) for n in range(1, 6)
+    ]), 6000)[0]
+    assert chunk.prior_speakers == [], "the chunker leaves continuity to the analyze stage"
+    labels = [SpanLabel(span_id="c1p1s0", speaker="Ann"), SpanLabel(span_id="c1p2s0", speaker="Bob"),
+              SpanLabel(span_id="c1p3s0", speaker=NARRATOR), SpanLabel(span_id="c1p5s0", speaker="Cal"),
+              SpanLabel(span_id="c1p4s0", speaker="Ann")]
+    assert carry_speakers([], chunk, ChunkAnalysis(labels=labels)) == ["Ann", "Cal"], "span order, narrator ignored"
+    assert carry_speakers(["Zed", "Ann"], chunk, ChunkAnalysis(labels=labels[:1])) == ["Zed", "Ann"], "one speaker keeps the older one"
+    assert carry_speakers(["Zed", "Ann"], chunk, ChunkAnalysis(labels=labels[1:2])) == ["Ann", "Bob"]
+    assert carry_speakers(["Zed"], chunk, ChunkAnalysis()) == ["Zed"], "no dialogue: unchanged"

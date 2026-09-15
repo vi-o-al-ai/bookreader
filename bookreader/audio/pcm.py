@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from bookreader.jobs.paths import open_temp_beside
 from bookreader.types import SAMPLE_RATE, AudioClip, InputError
 
 log = logging.getLogger(__name__)
@@ -56,7 +57,8 @@ def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
     """Resample *x* from *src* Hz to *dst* Hz; returns float32 of length ``round(n * dst / src)``.
 
     Downsampling first low-passes with a 101-tap Kaiser-windowed sinc FIR (``np.convolve`` mode
-    ``'same'``), then linearly interpolates onto the new grid; upsampling interpolates only.
+    ``'same'``; a clip shorter than the kernel is zero-padded for the convolution and sliced back to
+    its own length), then linearly interpolates onto the new grid; upsampling interpolates only.
     """
     if src <= 0 or dst <= 0:
         raise ValueError(f"sample rates must be positive, got src={src} dst={dst}")
@@ -68,7 +70,8 @@ def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
     if n == 0 or n_out == 0:
         return np.zeros(n_out, dtype=np.float32)
     if dst < src:
-        y = np.convolve(y.astype(np.float64), _lowpass_kernel(src, dst), mode="same")
+        padded = np.pad(y.astype(np.float64), (0, max(0, RESAMPLE_TAPS - n)))
+        y = np.convolve(padded, _lowpass_kernel(src, dst), mode="same")[:n]
     t_new = np.arange(n_out, dtype=np.float64) * (src / dst)
     out = np.interp(t_new, np.arange(n, dtype=np.float64), y)
     return out.astype(np.float32)
@@ -118,19 +121,18 @@ def read_wav(path: Path | str) -> AudioClip:
 
 
 def write_wav(path: Path | str, clip: AudioClip) -> Path:
-    """Write *clip* as mono int16 WAV atomically (temp file in the same directory, then ``os.replace``)."""
+    """Write *clip* as mono int16 WAV atomically (unique temp file in the same directory, then
+    ``os.replace``), so concurrent writers of one cache entry never corrupt each other."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd, tmp = open_temp_beside(path)
     samples = np.ascontiguousarray(clip.samples, dtype="<i2")
     try:
-        with wave.open(str(tmp), "wb") as wf:
+        with os.fdopen(fd, "wb") as fh, wave.open(fh, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(int(clip.sample_rate))
             wf.writeframes(samples.tobytes())
         os.replace(tmp, path)
     finally:
-        if tmp.exists():
-            tmp.unlink()
+        tmp.unlink(missing_ok=True)
     return path

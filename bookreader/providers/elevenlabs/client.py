@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Iterable, TypeVar
 
-from bookreader.retry import FamilyLimiter, with_retry
+from bookreader.retry import FamilyLimiter
 from bookreader.types import (
     SAMPLE_RATE,
     AudioClip,
@@ -25,6 +25,11 @@ FAMILY = "elevenlabs"
 INSTALL_HINT = "pip install 'bookreader[elevenlabs]'"
 OUTPUT_FORMAT = "pcm_22050"          # raw 16-bit little-endian mono PCM at the canonical rate
 TRANSIENT_STATUS: frozenset[int] = frozenset({408, 409, 429})
+# The SDK retries 408/409/429/5xx itself (2 extra attempts, up to 60 s of sleep each, inside the
+# family semaphore). Every adapter call passes this so bookreader's single retry layer (the
+# pipeline's ``with_retry``: 4 attempts, Retry-After honoured, sleeps outside the semaphore) is the
+# only backoff policy and the total budget per unit of work stays at 4 HTTP attempts.
+NO_SDK_RETRIES: dict[str, int] = {"max_retries": 0}
 
 T = TypeVar("T")
 
@@ -90,26 +95,22 @@ def map_error(exc: BaseException) -> BookreaderError:
 
 
 def guarded_call(fn: Callable[[], T], concurrency: int) -> T:
-    """Run one API call under the family semaphore with backoff on transient errors.
+    """Run one API call under the family semaphore, mapping SDK failures onto the taxonomy.
 
-    The semaphore is held only while the request is in flight (not during backoff sleeps), and
-    every non-bookreader exception is passed through :func:`map_error` first.
+    This is the only layer that acquires the ``elevenlabs`` FamilyLimiter, so callers (the
+    pipeline stages, ``warmup``) must never wrap adapter calls in it again: nesting the same
+    semaphore deadlocks at width 1 and halves the effective width otherwise. The semaphore is held
+    only while the request is in flight; retrying is left to the caller (the pipeline's
+    :func:`bookreader.retry.with_retry`), so backoff sleeps never hold a permit. Every
+    non-bookreader exception is passed through :func:`map_error` first.
     """
-
-    def attempt() -> T:
-        with FamilyLimiter.acquire(FAMILY, concurrency):
-            try:
-                return fn()
-            except BookreaderError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - every SDK failure is classified by map_error
-                raise map_error(exc) from exc
-
-    return with_retry(attempt, on_retry=_log_retry)
-
-
-def _log_retry(attempt: int, exc: BaseException, delay: float) -> None:
-    log.warning("elevenlabs call failed (attempt %d): %s; retrying in %.1fs", attempt, exc, delay)
+    with FamilyLimiter.acquire(FAMILY, concurrency):
+        try:
+            return fn()
+        except BookreaderError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - every SDK failure is classified by map_error
+            raise map_error(exc) from exc
 
 
 def check_sdk() -> list[str]:

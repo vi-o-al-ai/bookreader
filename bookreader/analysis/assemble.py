@@ -180,6 +180,7 @@ def assemble_script(
                 label, current_source = found
             if span.kind == "narration":
                 speaker, kind = NARRATOR, "narration"
+                label = None                              # narration is always the narrator, spoken plainly
             else:
                 speaker, kind = _resolve_speaker(label, span, bible, warnings), "dialogue"
             segments.append(

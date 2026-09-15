@@ -259,6 +259,22 @@ class JobStore:
         fields["finished_at"] = now_iso() if status in TERMINAL_STATUSES else None
         self.update_job(job_id, **fields)
 
+    def claim(self, job_id: str, from_statuses: tuple[JobStatus, ...] = (JobStatus.queued,)) -> bool:
+        """Atomically move the job to ``running`` when its status is one of *from_statuses*.
+
+        Returns False (and changes nothing) when the row is missing or already in another
+        status, so two workers holding the same id, or a stale queue entry left behind by a
+        cancel / delete / retry sequence, can never run one job twice.
+        """
+        statuses = [JobStatus(_enum_value(status)).value for status in from_statuses] or [JobStatus.queued.value]
+        placeholders = ", ".join("?" for _ in statuses)
+        cursor = self._conn().execute(
+            f"UPDATE jobs SET status = ?, error_json = NULL, finished_at = NULL, updated_at = ? "
+            f"WHERE id = ? AND status IN ({placeholders})",
+            (JobStatus.running.value, now_iso(), job_id, *statuses),
+        )
+        return cursor.rowcount == 1
+
     def request_cancel(self, job_id: str) -> None:
         """Set the cancel flag; the running job stops at its next checkpoint."""
         self.update_job(job_id, cancel_requested=True)

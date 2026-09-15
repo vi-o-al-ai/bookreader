@@ -6,7 +6,16 @@ import time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from bookreader.providers.base import NullUsage, UsageSink
-from bookreader.providers.elevenlabs.client import FAMILY, OUTPUT_FORMAT, api_key_from, check_sdk, guarded_call, make_client, pcm_to_clip
+from bookreader.providers.elevenlabs.client import (
+    FAMILY,
+    NO_SDK_RETRIES,
+    OUTPUT_FORMAT,
+    api_key_from,
+    check_sdk,
+    guarded_call,
+    make_client,
+    pcm_to_clip,
+)
 from bookreader.types import AudioClip, SfxRequest
 
 if TYPE_CHECKING:
@@ -63,6 +72,7 @@ class ElevenLabsSFX:
                     loop=req.loop,
                     model_id=SFX_MODEL,
                     output_format=OUTPUT_FORMAT,
+                    request_options=NO_SDK_RETRIES,
                 )
             ),
             self.concurrency,

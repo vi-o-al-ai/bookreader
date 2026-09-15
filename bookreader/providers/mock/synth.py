@@ -403,7 +403,7 @@ _MOOD_RECIPES: dict[str, _MoodRecipe] = {
     "romantic": _MoodRecipe(123.47, (0, 4, 7, 11, 14), 66, "pad", 3, 0.12, 0.65, (0, 5, 9, 7)),
 }
 _MUSIC_EDGE_FADE_MS = 200.0
-_CHORD_SEAM_MS = 40.0
+_CHORD_SEAM_MS = 40.0   # pad chords overlap-add with an equal-power crossfade of this length
 
 
 def _tone(freq: float, n: int, recipe: _MoodRecipe, energy: float) -> np.ndarray:
@@ -422,7 +422,13 @@ def _render_pad(freqs: list[float], n: int, recipe: _MoodRecipe, energy: float) 
             out += 0.5 * (_tone(f * 0.996, n, recipe, energy) + _tone(f * 1.004, n, recipe, energy))
         else:
             out += _tone(f, n, recipe, energy)
-    return out / max(1, len(freqs)) * adsr(n, _CHORD_SEAM_MS, 0.0, 1.0, _CHORD_SEAM_MS)
+    return out / max(1, len(freqs))
+
+
+def _seam_ramps(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """(fade-out, fade-in) equal-power cos/sin ramps of *n* samples for the pad chord seams."""
+    theta = (np.arange(n, dtype=np.float64) + 0.5) / max(n, 1) * (math.pi / 2.0)
+    return np.cos(theta).astype(np.float32), np.sin(theta).astype(np.float32)
 
 
 def _render_arp(freqs: list[float], n: int, step: int, recipe: _MoodRecipe, energy: float) -> np.ndarray:
@@ -470,6 +476,8 @@ def music_bed(mood: str, energy: float, duration_ms: int, seed: int) -> np.ndarr
     lfo_phase = float(rng.uniform(0.0, _TWO_PI))
 
     out = np.zeros(n, dtype=np.float32)
+    seam = max(1, min(_samples(_CHORD_SEAM_MS, sr), chord_len))
+    fade_out, fade_in = _seam_ramps(seam)
     for c in range(math.ceil(n / chord_len)):
         s0 = c * chord_len
         s1 = min(n, s0 + chord_len)
@@ -481,7 +489,14 @@ def music_bed(mood: str, energy: float, duration_ms: int, seed: int) -> np.ndarr
         elif recipe.mode == "pulse":
             piece = _render_pulse(freqs, s1 - s0, step, recipe, energy)
         else:
+            # Pads are sustained: each chord runs `seam` samples into the next and the two are
+            # overlap-added with an equal-power crossfade, so the bed never dips at a chord change.
+            s1 = min(n, s0 + chord_len + seam)
             piece = _render_pad(freqs, s1 - s0, recipe, energy)
+            if c > 0:
+                piece[:seam] *= fade_in[: len(piece)]
+            if s1 - s0 > chord_len:
+                piece[chord_len:] *= fade_out[: s1 - s0 - chord_len]
         out[s0:s1] += piece
 
     if recipe.lfo_hz > 0.0:

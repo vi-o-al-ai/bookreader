@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bookreader</title>
+<link rel="icon" href="data:,">
 <style>
   :root { --bg:#f4f4f2; --card:#fff; --ink:#1d1d1b; --muted:#6b6b66; --line:#dedcd6; --accent:#2f5d8a; --ok:#2c7a4b; --warn:#b26a00; --bad:#b3261e; }
   * { box-sizing:border-box; }
@@ -142,6 +143,22 @@
   }
 
   // ---------------------------------------------------------------- upload
+  // Same rules as the CLI's parse_chapters: 1-based, both bounds, ascending ("2-" and "3-1" are errors).
+  function parseChapters(text) {
+    const set = new Set();
+    for (const raw of text.split(',')) {
+      const part = raw.trim();
+      if (!part) continue;
+      const m = part.match(/^(\d+)(?:-(\d+))?$/);
+      if (!m) return { error: 'invalid chapter range "' + part + '"; use forms like 3 or 1-4' };
+      const a = Number(m[1]); const b = m[2] ? Number(m[2]) : a;
+      if (a < 1 || b < a) return { error: 'invalid chapter range "' + part + '"' };
+      if (b - a >= 10000) return { error: 'chapter range "' + part + '" is too large' };
+      for (let i = a; i <= b; i++) set.add(i);
+    }
+    return { list: Array.from(set).sort((x, y) => x - y) };
+  }
+
   $('upload').addEventListener('submit', (ev) => {
     ev.preventDefault();
     const form = ev.target;
@@ -151,14 +168,9 @@
     const options = { music: form.music.checked, sfx: form.sfx.checked };
     const range = form.chapters.value.trim();
     if (range) {
-      const chapters = [];
-      range.split(',').forEach((part) => {
-        const m = part.trim().match(/^(\d+)(?:-(\d+))?$/);
-        if (!m) return;
-        const a = Number(m[1]); const b = m[2] ? Number(m[2]) : a;
-        for (let i = Math.min(a, b); i <= Math.max(a, b); i++) chapters.push(i);
-      });
-      if (chapters.length) options.chapters = chapters;
+      const chapters = parseChapters(range);
+      if (chapters.error) { $('upload-msg').textContent = 'error: ' + chapters.error; return; }
+      if (chapters.list.length) options.chapters = chapters.list;
     }
     fd.append('options', JSON.stringify(options));
     $('upload-msg').textContent = 'uploading…';
@@ -178,6 +190,7 @@
       if (!res.jobs.length) { ul.innerHTML = '<li class="muted">no jobs yet</li>'; return; }
       res.jobs.forEach((j) => {
         const li = document.createElement('li');
+        li.dataset.id = j.id;
         li.className = j.id === state.selected ? 'selected' : '';
         li.innerHTML = '<span class="t" title="' + esc(j.id) + '">' + esc(j.title || j.id) + '</span>' +
           '<span><span class="badge ' + esc(j.status) + '">' + esc(j.status) + '</span> ' + Math.round(j.overall_pct) + '%</span>';
@@ -194,7 +207,7 @@
     $('log').textContent = '';
     $('cast-card').classList.add('hidden'); $('chapters-card').classList.add('hidden');
     $('panel-body').classList.remove('hidden');
-    document.querySelectorAll('#jobs li').forEach((li) => li.classList.toggle('selected', li.title === jobId));
+    document.querySelectorAll('#jobs li').forEach((li) => li.classList.toggle('selected', li.dataset.id === jobId));
     poll();
   }
 
@@ -242,13 +255,17 @@
     $('btn-delete').disabled = st.status === 'running';
   }
 
+  const EVENTS_PAGE = 1000;
+  // Pages through every event newer than lastEventId (a finished job is polled once, so one page is not enough).
   function loadEvents(jobId) {
-    return api('jobs/' + encodeURIComponent(jobId) + '/events?after=' + state.lastEventId).then((res) => {
-      if (state.selected !== jobId || !res.events.length) return;
+    return api('jobs/' + encodeURIComponent(jobId) + '/events?limit=' + EVENTS_PAGE + '&after=' + state.lastEventId).then((res) => {
+      if (state.selected !== jobId || !res.events.length) return undefined;
       const pre = $('log');
       res.events.forEach((ev) => { pre.textContent += ev.ts.slice(11, 19) + ' ' + ev.level.toUpperCase().padEnd(5) + ' ' + (ev.stage ? '[' + ev.stage + '] ' : '') + ev.message + '\n'; });
       pre.scrollTop = pre.scrollHeight;
       state.lastEventId = res.last_id;
+      if (res.events.length === EVENTS_PAGE) return loadEvents(jobId);
+      return undefined;
     }).catch(() => {});
   }
 
@@ -268,8 +285,13 @@
       loadJobs();
     }).catch((e) => alert(e.message));
   });
+  // Restart the single poll chain (a scheduled poll must be cleared first, or every click would add another loop).
+  function repoll() {
+    if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+    poll();
+  }
   function action(name, opts) {
-    api('jobs/' + encodeURIComponent(state.selected) + '/' + name, opts).then(() => { state.cast = null; state.manifest = null; poll(); loadJobs(); }).catch((e) => alert(e.message));
+    api('jobs/' + encodeURIComponent(state.selected) + '/' + name, opts).then(() => { state.cast = null; state.manifest = null; repoll(); loadJobs(); }).catch((e) => alert(e.message));
   }
 
   // ---------------------------------------------------------------- cast
@@ -305,7 +327,7 @@
     if (!Object.keys(overrides).length) { $('cast-msg').textContent = 'nothing changed'; return; }
     $('cast-msg').textContent = 'submitting…';
     api('jobs/' + encodeURIComponent(state.selected) + '/cast', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ overrides }) })
-      .then(() => { state.cast = null; state.manifest = null; state.chapterManifests = {}; $('cast-card').classList.add('hidden'); poll(); loadJobs(); })
+      .then(() => { state.cast = null; state.manifest = null; state.chapterManifests = {}; $('cast-card').classList.add('hidden'); repoll(); loadJobs(); })
       .catch((e) => { $('cast-msg').textContent = 'error: ' + e.message; });
   });
 

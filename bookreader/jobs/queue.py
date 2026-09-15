@@ -47,10 +47,27 @@ class InProcessQueue:
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._threads: list[threading.Thread] = []
         self._running: dict[str, str] = {}
+        self._pending: set[str] = set()       # ids waiting in _queue that a worker should still run
         self._lock = threading.Lock()
 
     def submit(self, job_id: str) -> None:
+        """Queue *job_id* once: a second submit while the id is still waiting is a no-op, so a
+        cancel-then-retry (or re-cast) of a queued job never runs it twice."""
+        with self._lock:
+            if job_id in self._pending:
+                log.info("job %s is already queued; ignoring duplicate submit", job_id)
+                return
+            self._pending.add(job_id)
         self._queue.put(job_id)
+
+    def discard(self, job_id: str) -> bool:
+        """Forget a waiting *job_id* (cancelled or deleted while queued); the worker skips its
+        entry. Returns whether it was waiting. A job already running is not affected."""
+        with self._lock:
+            if job_id not in self._pending:
+                return False
+            self._pending.discard(job_id)
+            return True
 
     def start(self) -> None:
         """Spawn the worker threads (idempotent)."""
@@ -77,7 +94,8 @@ class InProcessQueue:
         self._threads = []
 
     def depth(self) -> int:
-        return self._queue.qsize()
+        with self._lock:
+            return len(self._pending)
 
     def running(self) -> list[str]:
         """Ids of the jobs currently being run."""
@@ -94,6 +112,10 @@ class InProcessQueue:
             if job_id is None:
                 break
             with self._lock:
+                if job_id not in self._pending:       # discarded (cancelled/deleted) or a duplicate entry
+                    self._queue.task_done()
+                    continue
+                self._pending.discard(job_id)
                 self._running[name] = job_id
             try:
                 self.run(job_id, self.stop_event)
@@ -126,6 +148,10 @@ class InlineQueue:
 
     def depth(self) -> int:
         return 0
+
+    def discard(self, job_id: str) -> bool:
+        del job_id  # nothing ever waits
+        return False
 
     def running(self) -> list[str]:
         return []

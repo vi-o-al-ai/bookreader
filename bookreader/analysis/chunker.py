@@ -10,12 +10,30 @@ from __future__ import annotations
 
 import logging
 
-from bookreader.types import Chapter, Chunk, Paragraph
+from bookreader.types import NARRATOR, Chapter, Chunk, ChunkAnalysis, Paragraph
 
 log = logging.getLogger(__name__)
 
 CONTEXT_PARAGRAPHS = 2          # how many preceding paragraphs feed Chunk.context_before
 PARAGRAPH_SEPARATOR_CHARS = 2   # "\n\n" between paragraphs, as in Chapter.text
+PRIOR_SPEAKERS = 2              # how many distinct recent speakers feed Chunk.prior_speakers
+
+
+def carry_speakers(previous: list[str], chunk: Chunk, analysis: ChunkAnalysis) -> list[str]:
+    """The ``prior_speakers`` for the chunk that follows *chunk*: the last two distinct
+    non-narrator speakers of its quote spans (in span order), most recent last, falling back to
+    *previous* (the speakers carried into *chunk*) when it named fewer than two.
+    """
+    quote_ids = {span.id: index for index, span in enumerate(chunk.spans) if span.kind == "quote"}
+    labelled = {label.span_id: label.speaker for label in analysis.labels}
+    recent = list(previous)
+    for span_id in sorted(quote_ids, key=quote_ids.__getitem__):
+        speaker = labelled.get(span_id)
+        if not speaker or speaker == NARRATOR:
+            continue
+        recent = [name for name in recent if name != speaker] + [speaker]
+        del recent[:-PRIOR_SPEAKERS]
+    return recent
 
 
 def make_chunks(chapter: Chapter, max_chars: int) -> list[Chunk]:

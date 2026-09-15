@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any, Iterator
@@ -277,20 +278,73 @@ class FakePipeline:
         yield types.SimpleNamespace(graphemes=text[5:], audio=FakeTensor(self.audio[half:]))
 
 
-def test_kokoro_check_requires_package_and_espeak(monkeypatch: pytest.MonkeyPatch):
+def test_kokoro_check_requires_package_and_only_warns_without_espeak(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "kokoro", None)
     with pytest.raises(ProviderConfigError) as exc:
         KokoroTTS.check(settings_with(local_tts_engine="kokoro"))
     assert "bookreader[local-kokoro]" in str(exc.value)
 
+    # kokoro's misaki[en] bundles libespeak-ng (espeakng-loader) and never shells out, so a missing
+    # binary must not refuse startup: it is surfaced as a warning only.
     stub_module(monkeypatch, "kokoro", KPipeline=object)
     monkeypatch.setattr(shutil, "which", lambda _name: None)
-    with pytest.raises(ProviderConfigError) as exc2:
-        LocalTTS.check(settings_with(local_tts_engine="kokoro"))
-    assert "espeak-ng" in str(exc2.value) and "apt-get install espeak-ng" in str(exc2.value)
+    warnings = LocalTTS.check(settings_with(local_tts_engine="kokoro"))
+    assert len(warnings) == 1 and "espeak-ng" in warnings[0] and "apt-get install espeak-ng" in warnings[0]
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/espeak-ng" if name == "espeak-ng" else None)
     assert KokoroTTS.check(settings_with(local_tts_engine="kokoro")) == []
+
+
+def test_kokoro_lang_is_validated_at_check_time(monkeypatch: pytest.MonkeyPatch):
+    """KPipeline asserts on an unknown lang_code at first use; check() must turn that into a
+    ProviderConfigError naming the variable and the valid codes instead of a job-time crash."""
+    stub_module(monkeypatch, "kokoro", KPipeline=object)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/espeak-ng")
+    for bad in ("en", "english", "us", "", "a b"):
+        with pytest.raises(ProviderConfigError) as exc:
+            LocalTTS.check(settings_with(local_tts_engine="kokoro", kokoro_lang=bad))
+        assert "BOOKREADER_KOKORO_LANG" in str(exc.value) and "a, b, e, f, h, i, p, j, z" in str(exc.value)
+        assert repr(bad) in str(exc.value)
+    for good in ("a", "B", "A ", "en-us", "EN-GB", "ja", "zh", "pt-br"):
+        assert KokoroTTS.check(settings_with(local_tts_engine="kokoro", kokoro_lang=good)) == []
+
+    built: list[dict[str, Any]] = []
+    stub_module(monkeypatch, "kokoro", KPipeline=lambda **kw: built.append(kw) or FakePipeline(kw["lang_code"]))
+    kokoro = KokoroTTS.from_settings(settings_with(local_tts_engine="kokoro", kokoro_lang="EN-GB"))
+    assert kokoro.lang == "b" and kokoro.cache_version == "kokoro:b"
+    kokoro.warmup()
+    assert built == [{"lang_code": "b"}]
+    with pytest.raises(ProviderConfigError):
+        KokoroTTS(pipeline_factory=lambda lang: FakePipeline(lang), lang="english")
+
+
+def test_kokoro_synthesis_is_serialized_across_threads():
+    """KPipeline's espeak fallback shares one non-reentrant libespeak-ng handle, so synthesize()
+    must never run two pipeline calls at once (piper guards the same library with a lock)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    state = {"in_flight": 0, "max_in_flight": 0}
+    lock = threading.Lock()
+
+    class SlowPipeline(FakePipeline):
+        def __call__(self, text: str, **kw: Any) -> Iterator[Any]:
+            with lock:
+                state["in_flight"] += 1
+                state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+            try:
+                time.sleep(0.02)
+                yield from super().__call__(text, **kw)
+            finally:
+                with lock:
+                    state["in_flight"] -= 1
+
+    tts = KokoroTTS(pipeline_factory=SlowPipeline, lang="a")
+    req = TTSRequest(text="Only you, so far.", voice_id="af_heart")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        clips = list(pool.map(lambda _: tts.synthesize(req), range(8)))
+    assert len(clips) == 8 and all(clip.duration_ms == clips[0].duration_ms for clip in clips)
+    assert state["max_in_flight"] == 1
 
 
 def test_kokoro_synthesize_concatenates_24k_audio_and_resamples():

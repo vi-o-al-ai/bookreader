@@ -93,6 +93,15 @@ def test_resample_keeps_tone_peak_and_length(src: int) -> None:
     np.testing.assert_array_equal(pcm.resample(x, src, src), x)       # same rate: untouched
 
 
+@pytest.mark.parametrize("n", [2, 50, 100, 101, 500])
+def test_resample_handles_clips_shorter_than_the_fir(n: int) -> None:
+    y = pcm.resample(np.ones(n, dtype=np.int16), 44100, SAMPLE_RATE)
+    assert len(y) == round(n * SAMPLE_RATE / 44100)
+    assert len(pcm.resample(np.ones(n, dtype=np.int16), 48000, SAMPLE_RATE)) == round(n * SAMPLE_RATE / 48000)
+    short = pcm.to_canonical(AudioClip(np.full(50, 1000, dtype=np.int16), 48000))
+    assert short.sample_rate == SAMPLE_RATE and len(short.samples) == round(50 * SAMPLE_RATE / 48000)
+
+
 def test_to_canonical_resamples_only_when_needed() -> None:
     clip = AudioClip(pcm.to_int16(tone(440.0, 200, rate=44100)), 44100)
     canon = pcm.to_canonical(clip)
@@ -131,6 +140,18 @@ def test_normalize_rms_hits_target_and_respects_max_gain() -> None:
     w = dsp.normalize_rms(padded, target_dbfs=-20, max_gain_db=40)
     assert abs(dsp.rms_dbfs(w[SAMPLE_RATE:]) + 20.0) < 0.5
     assert np.all(dsp.normalize_rms(np.zeros(500, dtype=np.float32)) == 0.0)
+
+
+def test_normalize_rms_caps_gain_at_the_peak_ceiling() -> None:
+    # sparse transients: a -40 dBFS tone body with a few 0.5 spikes, voiced-frame RMS far below the peak
+    x = tone(220.0, 1000, amp=0.01)
+    x[::2205] = 0.5
+    y = dsp.normalize_rms(x, target_dbfs=-20, max_gain_db=12)
+    assert np.max(np.abs(y)) <= dsp.db_to_gain(-1.0) + 1e-6
+    assert np.max(np.abs(y)) > 0.5                                 # some boost was still applied
+    unguarded = dsp.normalize_rms(x, target_dbfs=-20, max_gain_db=12, peak_ceiling_dbfs=None)
+    assert np.max(np.abs(unguarded)) > 1.0                         # this is what got hard-clipped before
+    assert abs(dsp.rms_dbfs(dsp.normalize_rms(tone(220.0, 400, amp=0.05), target_dbfs=-20, max_gain_db=40)) + 20.0) < 0.5
 
 
 def test_crossfade_is_continuous_and_right_length() -> None:

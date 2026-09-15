@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from bookreader.analysis.bible import apply_updates, finalize, register_speaker
-from bookreader.analysis.chunker import make_chunks
+from bookreader.analysis.chunker import carry_speakers, make_chunks
 from bookreader.analysis.validate import AnalysisInvalid, validate_chunk_analysis
 from bookreader.ingest import load_book
 from bookreader.providers.base import NullUsage, TextAnalyzer, resolve
@@ -54,7 +54,7 @@ EXPECTED_MUSIC = {1: [("start", "tense")], 2: [("change", "calm"), ("change", "w
 
 
 class BookRun:
-    """The analyze stage in miniature: chunks in order, bible threaded, prior_mood carried."""
+    """The analyze stage in miniature: chunks in order, bible threaded, prior_mood and prior_speakers carried."""
 
     def __init__(self, book: Book, max_chars: int = 6000) -> None:
         self.book = book
@@ -70,8 +70,9 @@ class BookRun:
             self.chapter_prior[chapter.index] = prior
             self.analyses[chapter.index] = []
             self.chunks[chapter.index] = []
+            speakers: list[str] = []
             for chunk in make_chunks(chapter, max_chars):
-                chunk = chunk.model_copy(update={"prior_mood": prior})
+                chunk = chunk.model_copy(update={"prior_mood": prior, "prior_speakers": speakers})
                 analysis = analyzer.analyze_chunk(chunk, bible)
                 analysis, _ = validate_chunk_analysis(analysis, chunk, bible)
                 bible = apply_updates(bible, analysis.characters, chapter.index)
@@ -80,6 +81,7 @@ class BookRun:
                     self.labels[label.span_id] = label
                 for cue in analysis.music_cues:
                     prior = "none" if cue.action == "stop" else cue.mood
+                speakers = carry_speakers(speakers, chunk, analysis)
                 self.analyses[chapter.index].append(analysis)
                 self.chunks[chapter.index].append(chunk)
         self.raw_bible = bible
@@ -232,6 +234,44 @@ def test_small_chunks_still_resolve_name_introduction(book: Book) -> None:
     assert [(c.action, c.mood) for c in small.music(2)] == [("change", "calm"), ("change", "warm")]
 
 
+def test_small_chunks_keep_the_conversation_across_chunk_boundaries(book: Book, run: BookRun) -> None:
+    small = BookRun(book, max_chars=300)
+    narrated = [span_id for span_id, label in small.labels.items() if label.speaker == NARRATOR]
+    assert narrated == [], "no quote falls to the narrator just because a chunk cut landed mid-exchange"
+    assert small.labels["c2p12s0"].speaker == small.labels["c2p12s2"].speaker == "Ansel Vey"
+    assert small.labels["c2p12s0"].speaker == run.labels["c2p12s0"].speaker, "same answer as at 6000 chars"
+    assert small.chunks[2][-1].prior_speakers, "the stage passes who spoke last into the next chunk"
+
+
+def test_untagged_exchange_alternates_across_a_chunk_cut(tmp_path: Path) -> None:
+    lines = ["I never said that.", "You did, and you know it.", "Then prove it.", "I don't have to.", "Fine.", "Fine."]
+    text = (
+        "Ilse found her brother Aldo in the barn, sitting on a bucket with his head in his hands, and the "
+        "argument that had been waiting all week began before either of them had thought of a kinder way in.\n\n"
+        '"You sold the mare," Ilse said.\n\n"I had no choice," said Aldo.\n\n' + "\n\n".join(f'"{line}"' for line in lines) + "\n"
+    )
+    path = tmp_path / "cut.txt"
+    path.write_text(text, encoding="utf-8")
+    chapter = load_book(path).chapters[0]
+    chunks = make_chunks(chapter, 120)
+    assert len(chunks) >= 3 and all(not any(NAME in c.context_before for NAME in ("Ilse", "Aldo")) for c in chunks[2:]), \
+        "later chunks see only bare quotes in their context"
+    analyzer, bible, speakers, labels = HeuristicAnalyzer(), CastBible(), [], {}
+    for chunk in chunks:
+        chunk = chunk.model_copy(update={"prior_speakers": speakers})
+        analysis = analyzer.analyze_chunk(chunk, bible)
+        bible = apply_updates(bible, analysis.characters, 1)
+        for label in analysis.labels:
+            bible, _ = register_speaker(bible, label.speaker, 1)
+            labels[label.span_id] = label.speaker
+        speakers = carry_speakers(speakers, chunk, analysis)
+    ordered = [labels[f"c1p{n}s0"] for n in range(2, 10)]
+    assert ordered == ["Ilse", "Aldo"] * 4, ordered
+
+    stateless = HeuristicAnalyzer().analyze_chunk(chunks[-1], bible)
+    assert any(label.speaker == NARRATOR for label in stateless.labels), "without prior_speakers the tail chunk falls to the narrator"
+
+
 def test_three_speaker_untagged_exchange_degrades_gracefully(tmp_path: Path) -> None:
     text = (
         "Ann looked at Bob and then at Cal. The three of them stood on the quay while the tide came in and "
@@ -253,6 +293,31 @@ def test_three_speaker_untagged_exchange_degrades_gracefully(tmp_path: Path) -> 
     assert analysis.warnings, "guesses among three participants are reported"
     assert any("ambiguous" in warning for warning in analysis.warnings)
     assert {u.name for u in analysis.characters} == {"Ann", "Bob", "Cal"}
+
+
+@pytest.mark.parametrize("exclamation", ["Riders,", "Nonsense,", "Careful!", "Quiet!", "Liar!"])
+def test_one_word_exclamations_are_not_vocatives_and_create_no_character(tmp_path: Path, exclamation: str) -> None:
+    text = (
+        "Halloran took the first watch while Brannock slept, and the fire had burned down to embers by the time "
+        "the wind moved in the dry grass beyond the camp and the first sound of the road reached them.\n\n"
+        '"Wake me at midnight," said Brannock.\n\n"I will," Halloran said.\n\n'
+        f'"{exclamation}" Halloran whispered.\n\n'
+        'Brannock was awake at once. "How many?"\n\n"Two. Maybe three."\n'
+    )
+    path = tmp_path / "riders.txt"
+    path.write_text(text, encoding="utf-8")
+    chapter = load_book(path).chapters[0]
+    chunk = make_chunks(chapter, 6000)[0]
+    analysis = HeuristicAnalyzer().analyze_chunk(chunk, CastBible())
+    labelled = {label.span_id: label.speaker for label in analysis.labels}
+    assert labelled["c1p4s0"] == "Halloran"
+    assert labelled["c1p6s0"] == "Halloran", "the reply to Brannock's question is not given to a phantom addressee"
+    assert {u.name for u in analysis.characters} == {"Halloran", "Brannock"}
+
+
+def test_vocative_naming_a_character_seen_in_narration_is_the_addressee(book: Book, run: BookRun) -> None:
+    # 'Tobias!' opens chapter 1 before any tag names him; narration ('Tobias was only twelve') corroborates the name
+    assert run.labels["c1p2s0"].speaker == "Mara Quill" and run.labels["c1p3s1"].speaker == "Tobias"
 
 
 def test_unattributable_quote_goes_to_narrator_with_warning() -> None:
@@ -305,8 +370,8 @@ def test_scene_break_resets_the_conversation(tmp_path: Path) -> None:
     assert {u.name for u in analysis.characters} == {"Ann", "Bob", "Cal"}
 
     unaware = HeuristicAnalyzer().analyze_chunk(chunk.model_copy(update={"scene_break_paragraphs": []}), CastBible())
-    leaked = {label.span_id: label.speaker for label in unaware.labels}["c1p7s0"]
-    assert leaked in {"Ann", "Bob"}, "without the scene-break info the pre-break exchange leaks into the new scene"
+    assert any("ambiguous" in w and "Ann" in w for w in unaware.warnings), \
+        "without the scene-break info the pre-break participants stay candidates for the new scene's first quote"
 
 
 def test_scene_break_lets_the_mood_change_without_lookahead() -> None:
@@ -327,7 +392,7 @@ def test_scene_break_lets_the_mood_change_without_lookahead() -> None:
 def test_provider_contract(mock_settings) -> None:
     analyzer = HeuristicAnalyzer()
     assert isinstance(analyzer, TextAnalyzer)
-    assert (HeuristicAnalyzer.family, analyzer.cache_version, analyzer.model_id) == ("mock", "1", "heuristic-1")
+    assert (HeuristicAnalyzer.family, analyzer.cache_version, analyzer.model_id) == ("mock", "2", "heuristic-1")
     assert HeuristicAnalyzer.check(mock_settings) == []
     built = HeuristicAnalyzer.from_settings(mock_settings, NullUsage())
     assert isinstance(built, HeuristicAnalyzer)
@@ -373,6 +438,29 @@ def test_validate_drops_unknown_labels_and_fills_missing_with_heuristic(ch1_chun
     assert repaired.warnings == warnings and repaired.source == "llm"
 
 
+def test_validate_drops_labels_on_narration_spans(ch1_chunk: Chunk, book: Book) -> None:
+    narration = next(span for span in ch1_chunk.spans if span.kind == "narration")
+    labels = [*_labels_for(ch1_chunk), SpanLabel(span_id=narration.id, speaker="Tobias", emotion="angry", delivery="shout")]
+    repaired, warnings = validate_chunk_analysis(ChunkAnalysis(labels=labels, source="llm"), ch1_chunk, CastBible())
+    assert narration.id not in {label.span_id for label in repaired.labels}
+    assert any(narration.id in w and "narration" in w for w in warnings)
+    from bookreader.analysis.assemble import assemble_script
+
+    unrepaired = ChunkAnalysis(labels=labels, source="llm")
+    segment = next(s for s in assemble_script(book.chapters[0], [unrepaired], CastBible(), "none").segments if s.id == narration.id)
+    assert (segment.speaker, segment.emotion, segment.delivery) == (NARRATOR, "neutral", "normal"), "assembly never lets a label shout the narrator"
+
+
+def test_validate_resolves_specific_descriptor_speakers_to_the_known_character(ch1_chunk: Chunk) -> None:
+    bible = apply_updates(CastBible(), [CharacterUpdate(name="Mara Quill", gender="female", age="adult"), CharacterUpdate(name="Tobias", gender="male", age="child")], 1)
+    repaired, warnings = validate_chunk_analysis(ChunkAnalysis(labels=_labels_for(ch1_chunk, speaker="the boy"), source="llm"), ch1_chunk, bible)
+    assert {label.speaker for label in repaired.labels} == {"Tobias"}
+    for label in repaired.labels:
+        bible, canonical = register_speaker(bible, label.speaker, 1)
+        assert canonical == "Tobias"
+    assert [entry.name for entry in finalize(bible).characters] == ["Mara Quill", "Tobias"], "no separate 'The Boy'"
+
+
 def test_validate_rejects_too_many_missing_labels(ch1_chunk: Chunk) -> None:
     analysis = ChunkAnalysis(labels=_labels_for(ch1_chunk)[:4])                 # 3 of 7 missing
     with pytest.raises(AnalysisInvalid) as info:
@@ -409,3 +497,114 @@ def test_validate_coerces_speakers_and_clamps_cues(ch1_chunk: Chunk) -> None:
     assert repaired.music_cues[0].energy == 0.0
     assert any("clamped" in w for w in warnings) and any("coerced" in w for w in warnings)
     assert analysis.sfx_cues[0].duration_s == 90.0, "input untouched"
+
+
+# --------------------------------------------------------------------------- attribution heuristics (regressions)
+ARGUMENT = (
+    "Rain drummed on the kitchen window while Dorian Ash set three cups on the table. His sister Petra had not sat "
+    "down, and their cousin Silas was leaning against the door frame with his arms folded.\n\n"
+    '"You sold it," Petra said. "You sold Father\'s boat without asking either of us."\n\n'
+    '"I asked," Dorian said. "I asked in March. You said do what you like."\n\n'
+    '"I said no such thing, Dorian."\n\n"You did, Petra. Silas was there."\n\n"Leave me out of it."\n\n'
+    '"You can\'t be left out of it, Silas. It was your name on the paper too."\n\n'
+    '"Then it was my name on a paper I never read."\n\n"Oh, that is convenient."\n\n"It\'s not convenient, it\'s true!"\n'
+)
+
+
+def _run_text(tmp_path: Path, name: str, text: str, max_chars: int = 6000) -> BookRun:
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return BookRun(load_book(path), max_chars=max_chars)
+
+
+def test_mid_quote_vocative_and_a_quote_is_never_spoken_by_its_addressee(tmp_path: Path) -> None:
+    run = _run_text(tmp_path, "argument.txt", ARGUMENT)
+    speakers = {span_id: label.speaker for span_id, label in run.labels.items()}
+    assert speakers["c1p5s0"] == "Dorian Ash", "'You did, Petra.' addresses Petra, so Petra does not speak it"
+    assert speakers["c1p7s0"] == "Dorian Ash", "a vocative before an interior sentence break is still a vocative"
+    assert speakers["c1p8s0"] == "Silas" and speakers["c1p10s0"] == "Silas"
+    silas = run.bible.find("Silas")
+    assert silas is not None and silas.line_count > 0, "the third speaker is cast"
+
+
+def test_gender_from_kinship_words_and_a_name_bounded_pronoun_window(tmp_path: Path) -> None:
+    run = _run_text(tmp_path, "argument.txt", ARGUMENT)
+    genders = {entry.name: entry.gender for entry in run.bible.characters}
+    assert genders == {"Dorian Ash": "male", "Petra": "female", "Silas": "male"}, "'His sister Petra' is not made male by Silas's 'his'"
+    text = (
+        "Marie waited on the bridge until the bells had stopped. Tomas came along the towpath with his coat over his "
+        "arm, in no hurry at all, and the water went on under them both.\n\n"
+        '"You are late," said Marie.\n\n"The bells were early," said Tomas.\n\n"Then your watch is wrong."\n'
+    )
+    run = _run_text(tmp_path, "bridge.txt", text)
+    genders = {entry.name: entry.gender for entry in run.bible.characters}
+    assert genders["Tomas"] == "male" and genders["Marie"] != "male", "Tomas's pronoun does not gender Marie"
+
+
+def test_pronoun_tag_prefers_the_subject_of_the_previous_sentence(tmp_path: Path) -> None:
+    text = (
+        "Halloran took the first watch while Brannock slept by the embers, and the wind moved in the dry grass beyond "
+        "the camp for a long time before anything else did.\n\n"
+        "Later, when the moon had gone behind the ridge, Halloran heard hooves on the road. He put his hand on "
+        "Brannock\'s shoulder.\n\n"
+        '"Riders," he whispered.\n\nBrannock was awake at once. "How many?"\n\n"Two. Maybe three."\n'
+    )
+    run = _run_text(tmp_path, "watch.txt", text)
+    assert run.labels["c1p3s0"].speaker == "Halloran", "'he' is the subject Halloran, not the possessive object Brannock"
+    assert run.labels["c1p4s1"].speaker == "Brannock" and run.labels["c1p5s0"].speaker == "Halloran"
+
+
+def test_possessive_mention_still_resolves_a_pronoun_tag_without_a_subject(run: BookRun) -> None:
+    assert run.labels["c2p10s0"].speaker == "Ansel Vey", "'...in Ansel\'s shaking hands.' then 'he said'"
+
+
+def test_self_introduction_inside_a_quote_names_the_descriptor_entry(tmp_path: Path) -> None:
+    text = (
+        "The road ran north between two hedges, and Wren walked it alone with her pack on her back. At the crossroads "
+        "a man was sitting on the milestone, whittling a stick, with a grey coat that had once been good.\n\n"
+        '"You\'re a long way from anywhere," the man said.\n\n"So are you," said Wren.\n\n'
+        '"True enough." The stranger put the stick away and stood. "Which way are you going?"\n\n"North. To Hallam."\n\n'
+        '"Then we\'re going the same way. My name is Corwin. Corwin Tallow." He held out his hand.\n\n'
+        'Wren took it. "Wren," she said.\n\n"You don\'t say much," Corwin said after a mile.\n\n"I don\'t have much to say."\n'
+    )
+    run = _run_text(tmp_path, "road.txt", text)
+    names = {entry.name: entry for entry in run.bible.characters}
+    assert set(names) == {"Wren", "Corwin Tallow"}, "one entry for the man, not 'The Man' plus 'Corwin'"
+    assert {"the man", "the stranger", "Corwin"} <= set(names["Corwin Tallow"].aliases)
+    assert names["Corwin Tallow"].gender == "male" and not names["Corwin Tallow"].provisional
+    his_lines = [span_id for span_id in ("c1p2s0", "c1p4s0", "c1p4s2", "c1p6s0", "c1p8s0") if span_id in run.labels]
+    assert {run.labels[span_id].speaker for span_id in his_lines} == {"Corwin Tallow"}
+
+
+CHAPTER_FOUR = (
+    "\n\nChapter 4: The Visitor\n\n"
+    "Two days later a man in a black coat came up the cliff road on foot and stood at the cottage door without "
+    "knocking. He was broad and grey-bearded and carried a leather case under one arm.\n\n"
+    '"I\'m looking for the keeper," the man said.\n\n"You\'ve found her," said Mara.\n\n'
+    '"Then I\'ll come in, if it\'s all the same to you. My name is Crane. I\'m from the Board."\n\n'
+    'Mara did not move from the doorway.\n\n"The Board sent a letter," Mara said. "It said all it needed to say."\n\n'
+    '"The letter said the light is closing," the man said. "It did not say what happens to the people in it."\n'
+)
+
+
+def test_descriptor_alias_of_an_earlier_character_does_not_reach_into_a_new_scene(sample_book_path: Path, tmp_path: Path) -> None:
+    run = _run_text(tmp_path, "plus.txt", sample_book_path.read_text(encoding="utf-8").rstrip() + CHAPTER_FOUR)
+    ansel = run.bible.find("Ansel Vey")
+    assert ansel is not None and {"the man", "the stranger", "Ansel"} <= set(ansel.aliases), "the fixture's aliases are kept"
+    crane_lines = [run.labels[i].speaker for i in ("c4p2s0", "c4p4s0", "c4p7s0", "c4p7s2")]
+    assert "Ansel Vey" not in crane_lines, crane_lines
+    assert len(set(crane_lines)) == 1
+    crane = run.bible.find("Crane")
+    assert crane is not None and crane.name == "Crane" and crane.line_count == 4
+    assert ansel.line_count == 9, "Ansel keeps only his own lines"
+
+
+def test_full_name_survives_a_chunk_cut_between_introduction_and_first_line(tmp_path: Path) -> None:
+    intro = ARGUMENT.split("\n\n")[0]
+    run = _run_text(tmp_path, "cut.txt", ARGUMENT, max_chars=len(intro) + 20)
+    assert run.chunks[1][0].spans[-1].id.startswith("c1p1s"), "the introduction paragraph is a chunk of its own"
+    dorian = run.bible.find("Dorian")
+    assert dorian is not None and dorian.name == "Dorian Ash" and "Dorian" in dorian.aliases
+    assert "Dorian Ash" in {entry.name for entry in run.bible.characters}
+    stateless = HeuristicAnalyzer().analyze_chunk(run.chunks[1][1].model_copy(update={"context_before": ""}), CastBible())
+    assert {u.name for u in stateless.characters if u.name.startswith("Dorian")} == {"Dorian"}, "without the context only the tag's single token is known"

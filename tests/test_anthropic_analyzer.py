@@ -48,11 +48,26 @@ class FakeAPITimeoutError(FakeAPIConnectionError):
 class FakeAPIStatusError(FakeAPIError):
     status_code: int = 0
 
-    def __init__(self, message: str = "", *, status_code: int | None = None, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status_code: int | None = None,
+        headers: dict[str, str] | None = None,
+        body: Any = None,
+    ) -> None:
         super().__init__(message)
         if status_code is not None:
             self.status_code = status_code
         self.response = SimpleNamespace(headers=headers or {})
+        self.body = body
+
+
+def sse_error(err_type: str, status_code: int = 200, headers: dict[str, str] | None = None) -> FakeAPIStatusError:
+    """What the SDK raises for an ``error`` SSE event after the stream started: a bare
+    APIStatusError carrying the stream's own 200 status and the error type only in the body."""
+    body = {"type": "error", "error": {"type": err_type, "message": err_type}}
+    return FakeAPIStatusError(str(body), status_code=status_code, headers=headers, body=body)
 
 
 class FakeBadRequestError(FakeAPIStatusError):
@@ -216,7 +231,7 @@ def quote_ids(chunk: Chunk) -> list[str]:
 
 def test_system_prompt_is_stable_and_versioned() -> None:
     assert SYSTEM_PROMPT.endswith(f"prompt-version: {PROMPT_VERSION}")
-    assert SYSTEM_PROMPT.endswith("prompt-version: 2")
+    assert SYSTEM_PROMPT.endswith("prompt-version: 3")
     for word in ("urgent", "whisper", "ominous", "nonbinary", "young_adult", "NARRATOR", "merge_into", "anchor_text"):
         assert word in SYSTEM_PROMPT
 
@@ -258,7 +273,7 @@ def test_request_kwargs_shape(chunk: Chunk, bible: CastBible, good_json: str) ->
     analyzer = make_analyzer(client, effort="high", max_tokens=12345)
     assert isinstance(analyzer, TextAnalyzer)
     assert analyzer.family == "anthropic"
-    assert analyzer.cache_version == "claude-opus-5:2"
+    assert analyzer.cache_version == "claude-opus-5:3"
     assert analyzer.model_id == "claude-opus-5"
 
     result = analyzer.analyze_chunk(chunk, bible)
@@ -287,6 +302,18 @@ def test_text_block_found_after_thinking_block(chunk: Chunk, bible: CastBible, g
     result = make_analyzer(FakeClient(msg)).analyze_chunk(chunk, bible)
     assert result.source == "llm"
     assert len(result.labels) == len(quote_ids(chunk))
+
+
+def test_empty_merge_into_means_no_merge(chunk: Chunk, bible: CastBible) -> None:
+    labels = [{"span_id": sid, "speaker": "Mara Quill", "emotion": "neutral", "delivery": "normal"} for sid in quote_ids(chunk)]
+    characters = [
+        {"name": "Mara Quill", "aliases": [], "gender": "female", "age": "adult", "description": "", "voice_notes": "", "merge_into": ""},
+        {"name": "Tobias", "aliases": [], "gender": "male", "age": "child", "description": "", "voice_notes": "", "merge_into": "the boy"},
+    ]
+    reply = json.dumps({"labels": labels, "characters": characters, "sfx_cues": [], "music_cues": []})
+    result = make_analyzer(FakeClient(message(reply))).analyze_chunk(chunk, bible)
+    assert result.source == "llm"
+    assert [c.merge_into for c in result.characters] == [None, "the boy"]
 
 
 def test_llm_labels_are_canonicalized_through_the_bible(chunk: Chunk) -> None:
@@ -369,6 +396,21 @@ def test_max_tokens_on_single_paragraph_is_permanent(bible: CastBible) -> None:
         make_analyzer(client).analyze_chunk(single, bible)
     assert info.value.unit == "ch01:chunk0"
     assert len(client.calls) == 1
+
+
+def test_context_window_exceeded_skips_repair_and_falls_back(chunk: Chunk, bible: CastBible, good_json: str, caplog: pytest.LogCaptureFixture) -> None:
+    """A reply cut off by ``model_context_window_exceeded`` cannot be repaired (the repair prompt
+    is strictly larger) nor helped by splitting the span list, so it goes straight to the heuristic
+    analyzer with a specific warning and no second paid request."""
+    truncated = message(good_json[: len(good_json) // 2], stop_reason="model_context_window_exceeded")
+    client = FakeClient(truncated, message(good_json))
+    with caplog.at_level("WARNING", logger="bookreader.providers.anthropic.analysis"):
+        result = make_analyzer(client).analyze_chunk(chunk, bible)
+    assert len(client.calls) == 1, "no repair request"
+    assert result.source == "heuristic"
+    assert "context_window_exceeded" in result.warnings and "llm_invalid" not in result.warnings
+    assert "context window" in caplog.text
+    assert len(result.labels) == len(quote_ids(chunk))
 
 
 def test_invalid_json_triggers_one_repair_then_heuristic(chunk: Chunk, bible: CastBible) -> None:
@@ -508,6 +550,90 @@ def test_map_error_table(anthropic_stub: types.ModuleType, factory: Any, expecte
     assert type(mapped) is expected
 
 
+@pytest.mark.parametrize(
+    "exc, expected, retry_after",
+    [
+        (sse_error("overloaded_error"), ProviderTransientError, None),
+        (sse_error("api_error"), ProviderTransientError, None),
+        (sse_error("rate_limit_error", headers={"retry-after": "4"}), ProviderTransientError, 4.0),
+        (FakeAPIStatusError("stream error", status_code=200, body="not json"), ProviderTransientError, None),
+        (FakeAPIStatusError("stream error", status_code=200), ProviderTransientError, None),
+        (sse_error("invalid_request_error"), ProviderPermanentError, None),
+        (sse_error("authentication_error"), ProviderPermanentError, None),
+        (sse_error("overloaded_error", status_code=529), ProviderTransientError, None),
+        (sse_error("invalid_request_error", status_code=400), ProviderPermanentError, None),
+    ],
+)
+def test_map_error_classifies_mid_stream_sse_errors_by_body_type(
+    anthropic_stub: types.ModuleType, exc: FakeAPIStatusError, expected: type, retry_after: float | None
+) -> None:
+    mapped = map_error(exc)
+    assert type(mapped) is expected
+    if expected is ProviderTransientError:
+        assert mapped.retry_after == retry_after
+
+
+def test_mid_stream_overloaded_error_is_retried(anthropic_stub: types.ModuleType, chunk: Chunk, bible: CastBible, good_json: str, no_sleep: list[float]) -> None:
+    client = FakeClient(sse_error("overloaded_error"), message(good_json))
+    result = make_analyzer(client).analyze_chunk(chunk, bible)
+    assert result.source == "llm"
+    assert len(client.calls) == 2 and len(no_sleep) == 1
+
+
+def test_mid_stream_invalid_request_is_permanent(anthropic_stub: types.ModuleType, chunk: Chunk, bible: CastBible, no_sleep: list[float]) -> None:
+    client = FakeClient(sse_error("invalid_request_error"))
+    with pytest.raises(ProviderPermanentError):
+        make_analyzer(client).analyze_chunk(chunk, bible)
+    assert len(client.calls) == 1 and no_sleep == []
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _stream_body(text: str, *, error_after_prefix: str | None = None) -> str:
+    """A text/event-stream reply; with *error_after_prefix* the stream emits a partial delta and
+    then an overloaded ``error`` event instead of finishing."""
+    start = [
+        _sse("message_start", {"type": "message_start", "message": {
+            "id": "m1", "type": "message", "role": "assistant", "model": "claude-opus-5", "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        _sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+    ]
+    if error_after_prefix is not None:
+        return "".join([
+            *start,
+            _sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text[:3]}}),
+            _sse("error", {"type": "error", "error": {"type": error_after_prefix, "message": "Overloaded"}}),
+        ])
+    return "".join([
+        *start,
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+        _sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 5}}),
+        _sse("message_stop", {"type": "message_stop"}),
+    ])
+
+
+def test_real_sdk_mid_stream_error_event_is_retried(chunk: Chunk, bible: CastBible, good_json: str, no_sleep: list[float]) -> None:
+    """Through the installed anthropic SDK over a mock transport: an SSE ``error`` event after the
+    stream started must be classified transient and retried (the SDK's own retry loop only covers
+    the initial request, and the exception it raises carries the stream's 200 status)."""
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+    bodies = iter([_stream_body(good_json, error_after_prefix="overloaded_error"), _stream_body(good_json)])
+    attempts: list[str] = []
+
+    def handler(request: Any) -> Any:
+        attempts.append(request.url.path)
+        return httpx2.Response(200, content=next(bodies).encode(), headers={"content-type": "text/event-stream"})
+
+    client = anthropic.Anthropic(api_key="sk-test", max_retries=0, http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
+    result = make_analyzer(client).analyze_chunk(chunk, bible)
+    assert result.source == "llm"
+    assert len(attempts) == 2 and len(no_sleep) == 1
+
+
 def test_map_error_passes_bookreader_errors_through() -> None:
     original = ProviderTransientError("mine", retry_after=2.0)
     assert map_error(original) is original
@@ -548,13 +674,15 @@ def test_from_settings_builds_client_from_secrets(anthropic_stub: types.ModuleTy
     sink = RecordingUsage()
     analyzer = ClaudeAnalyzer.from_settings(settings, sink)
     assert len(FakeAnthropic.instances) == 1
-    assert FakeAnthropic.instances[0].kwargs == {"api_key": "sk-test", "max_retries": 3, "timeout": 600}
+    assert FakeAnthropic.instances[0].kwargs == {"api_key": "sk-test", "max_retries": 0, "timeout": 600}, (
+        "the SDK's own retries are off: with_retry (4 attempts) is the single retry layer"
+    )
     assert analyzer.client is FakeAnthropic.instances[0]
     assert analyzer.model_id == "claude-test-1"
     assert analyzer.effort == "low"
     assert analyzer.max_tokens == 8000
     assert analyzer.concurrency == 2
-    assert analyzer.cache_version == "claude-test-1:2"
+    assert analyzer.cache_version == f"claude-test-1:{PROMPT_VERSION}"
     assert isinstance(analyzer.fallback, HeuristicAnalyzer)
     assert analyzer.usage is sink
     analyzer.warmup()

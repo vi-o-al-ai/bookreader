@@ -1,9 +1,15 @@
 """bookreader.audio.mixer - renders a ChapterTimeline into stems and a mastered mix.
 
 ``mix_chapter`` allocates one float32 buffer per track (voice, music, sfx), places every clip,
-ducks the music/ambient beds under speech, masters the sum with a soft limiter and writes
+shapes the music/ambient beds around speech, masters the sum with a soft limiter and writes
 ``mix.wav`` plus the three stems (all identical length). The stems are the post-gain, post-duck
 tracks, so ``voice + music + sfx`` equals the mix exactly whenever the limiter did not engage.
+
+Level design (spec MIXER): the music bed sits at ``settings.music_gain_db`` under speech (the
+beds are RMS-normalized to -20 dBFS in the render stage, so -14 dB puts them at -34 dBFS under a
+-20 dBFS voice) and rises ``MUSIC_GAP_BOOST_DB`` in speech-free gaps of at least
+``MUSIC_GAP_MIN_MS``; gaps the timeline opened for a blocking impact are not boosted. Ambient beds
+dip ``AMBIENT_DUCK_DB`` under speech; impacts are never ducked.
 """
 from __future__ import annotations
 
@@ -35,7 +41,8 @@ DUCK_FRAME_MS = 20
 SPEECH_THRESHOLD_DBFS = -45.0
 DUCK_ATTACK_MS = 40
 DUCK_RELEASE_MS = 600
-MUSIC_DUCK_DB = 8.0          # music attenuation under speech (and in short gaps)
+DUCK_LOOKAHEAD_MS = 60       # the gain starts dropping this early so speech onsets are not smeared over
+MUSIC_DUCK_DB = 0.0          # under speech the bed follows music_gain_db exactly (no extra attenuation)
 MUSIC_GAP_BOOST_DB = 5.0     # music rises this much in gaps longer than MUSIC_GAP_MIN_MS
 MUSIC_GAP_MIN_MS = 1200
 AMBIENT_DUCK_DB = 4.0        # ambient dip under speech
@@ -64,6 +71,8 @@ def duck_gain(
     *,
     gap_boost_db: float = 0.0,
     min_gap_ms: int = 0,
+    lookahead_ms: int = DUCK_LOOKAHEAD_MS,
+    hold: np.ndarray | None = None,
     frame_ms: int = DUCK_FRAME_MS,
     threshold_dbfs: float = SPEECH_THRESHOLD_DBFS,
     sample_rate: int = SAMPLE_RATE,
@@ -71,8 +80,11 @@ def duck_gain(
     """Per-sample gain curve driven by the voice envelope (one value per *frame_ms* frame).
 
     Under speech, and in gaps shorter than *min_gap_ms*, the gain is ``-depth_db``; in longer gaps it is
-    ``+gap_boost_db``. Transitions are one-pole smoothed: *attack_ms* when the gain drops (speech onset),
-    *release_ms* when it rises. The frame curve is linearly interpolated to sample resolution.
+    ``+gap_boost_db``. Speech presence is extended *lookahead_ms* earlier so the drop is complete by
+    the onset. Frames flagged in *hold* (one bool per frame, e.g. an impact sound playing in a gap the
+    timeline opened for it) count as busy: they stay at the speech gain and never earn the gap boost.
+    Transitions are one-pole smoothed: *attack_ms* when the gain drops (speech onset), *release_ms*
+    when it rises. The frame curve is linearly interpolated to sample resolution.
     """
     n_frames = len(voice_env)
     speech_gain = db_to_gain(-abs(depth_db))
@@ -80,6 +92,12 @@ def duck_gain(
     if n_frames == 0:
         return np.full(n_samples, gap_gain, dtype=np.float32)
     present = np.asarray(voice_env) > threshold_dbfs
+    lead = -(-lookahead_ms // frame_ms) if lookahead_ms > 0 else 0
+    for k in range(1, min(lead, n_frames - 1) + 1):
+        present[:-k] |= present[k:]
+    if hold is not None:
+        held = np.asarray(hold, dtype=bool)[:n_frames]
+        present[: len(held)] |= held
     target = np.full(n_frames, speech_gain, dtype=np.float64)
     min_gap_frames = -(-min_gap_ms // frame_ms) if min_gap_ms > 0 else 0
     for start, end in _gap_runs(present):
@@ -181,12 +199,19 @@ def mix_chapter(
 
     voice = render_track(by_track["voice"], load_clip, n, sample_rate)
     voice_env = rms_envelope(voice, DUCK_FRAME_MS, sample_rate)
+    # Un-ducked sfx (impacts) are rendered first: where one is sounding the music must not treat the
+    # silence around it (typically a blocking gap the timeline opened for it) as breathing room.
+    impacts = render_track([p for p in by_track["sfx"] if p.duck == "none"], load_clip, n, sample_rate)
+    impact_present = rms_envelope(impacts, DUCK_FRAME_MS, sample_rate) > SPEECH_THRESHOLD_DBFS
     curves = {
-        "music": duck_gain(voice_env, n, MUSIC_DUCK_DB, gap_boost_db=MUSIC_GAP_BOOST_DB, min_gap_ms=MUSIC_GAP_MIN_MS, sample_rate=sample_rate),
+        "music": duck_gain(
+            voice_env, n, MUSIC_DUCK_DB, gap_boost_db=MUSIC_GAP_BOOST_DB, min_gap_ms=MUSIC_GAP_MIN_MS,
+            hold=impact_present, sample_rate=sample_rate,
+        ),
         "ambient": duck_gain(voice_env, n, AMBIENT_DUCK_DB, sample_rate=sample_rate),
     }
     music = render_track(by_track["music"], load_clip, n, sample_rate, curves)
-    sfx = render_track(by_track["sfx"], load_clip, n, sample_rate, curves)
+    sfx = impacts + render_track([p for p in by_track["sfx"] if p.duck != "none"], load_clip, n, sample_rate, curves)
 
     stems = {"voice": to_int16(voice), "music": to_int16(music), "sfx": to_int16(sfx)}
     mixed, limited = master(voice, music, sfx)

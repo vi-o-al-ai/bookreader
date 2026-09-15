@@ -18,9 +18,10 @@ from typing import Any, Sequence, TextIO
 
 from bookreader import __version__
 from bookreader.analysis.chunker import make_chunks
-from bookreader.ingest import load_book
+from bookreader.ingest import SUPPORTED_SUFFIXES, load_book
+from bookreader.ingest.chapters import word_count
 from bookreader.jobs.db import JobStore
-from bookreader.jobs.paths import JobPaths
+from bookreader.jobs.paths import JobPaths, read_json, write_json
 from bookreader.pipeline.run import create_job, run_job
 from bookreader.providers.base import build_providers, describe_providers, validate_providers, warmup_providers
 from bookreader.settings import Settings
@@ -31,6 +32,8 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 PROGRESS_POLL_S = 0.25
+MAX_CHAPTER_RANGE = 10_000
+RERUN_INCOMPATIBLE_FLAGS = ("title", "chapters", "no_music", "no_sfx")   # baked into the previous job
 ANALYSIS_TOKENS_PER_CHUNK = 900     # same pre-flight assumptions as the ingest stage
 CHARS_PER_TOKEN = 4
 PROVIDER_FLAGS: dict[str, str] = {"analysis": "analysis_provider", "tts": "tts_provider", "music": "music_provider", "sfx": "sfx_provider"}
@@ -38,7 +41,11 @@ PROVIDER_FLAGS: dict[str, str] = {"analysis": "analysis_provider", "tts": "tts_p
 
 # --------------------------------------------------------------------------- helpers
 def parse_chapters(text: str | None) -> list[int] | None:
-    """``"1-3,5"`` -> ``[1, 2, 3, 5]``; None or empty -> None (all chapters)."""
+    """``"1-3,5"`` -> ``[1, 2, 3, 5]``; None or empty -> None (all chapters).
+
+    Chapters are 1-based, a range needs both bounds in ascending order (``"2-"`` is an error,
+    not "to the end") and one range may span at most ``MAX_CHAPTER_RANGE`` chapters.
+    """
     if not text or not text.strip():
         return None
     chapters: set[int] = set()
@@ -46,14 +53,18 @@ def parse_chapters(text: str | None) -> list[int] | None:
         part = part.strip()
         if not part:
             continue
-        low, _, high = part.partition("-")
+        low, dash, high = part.partition("-")
         try:
             start = int(low)
             end = int(high) if high else start
         except ValueError as exc:
             raise argparse.ArgumentTypeError(f"invalid chapter range {part!r}; use forms like 3 or 1-4") from exc
+        if dash and not high.strip():
+            raise argparse.ArgumentTypeError(f"invalid chapter range {part!r}; give both bounds, e.g. {start}-{start + 1}")
         if start < 1 or end < start:
             raise argparse.ArgumentTypeError(f"invalid chapter range {part!r}")
+        if end - start >= MAX_CHAPTER_RANGE:
+            raise argparse.ArgumentTypeError(f"chapter range {part!r} spans more than {MAX_CHAPTER_RANGE} chapters")
         chapters.update(range(start, end + 1))
     return sorted(chapters) or None
 
@@ -131,6 +142,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not source.is_file():
         print(f"InputError: cannot read {source}: no such file", file=sys.stderr)
         return EXIT_USAGE
+    if source.suffix.lower() not in SUPPORTED_SUFFIXES:   # checked before any job row or copy is made
+        print(f"InputError: unsupported file type '{source.suffix.lower() or source.name}'; supported: {', '.join(SUPPORTED_SUFFIXES)}", file=sys.stderr)
+        return EXIT_USAGE
+    from_stage = Stage(args.from_stage) if args.from_stage else None
+    if from_stage is not None:
+        given = [f"--{name.replace('_', '-')}" for name in RERUN_INCOMPATIBLE_FLAGS if getattr(args, name)]
+        if given:
+            print(f"InputError: {', '.join(given)} cannot be combined with --from-stage (the previous job's options are reused)", file=sys.stderr)
+            return EXIT_USAGE
+        if args.cast and STAGE_ORDER.index(from_stage) > STAGE_ORDER.index(Stage.cast):
+            print(f"InputError: --cast needs --from-stage cast (or earlier) to take effect, not {from_stage.value}", file=sys.stderr)
+            return EXIT_USAGE
     settings = _settings_from_args(args, data_dir=Path(args.out), worker_mode="inline")
     _configure_logging(settings)
     try:
@@ -156,12 +179,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     options = JobOptions(chapters=args.chapters, music=not args.no_music, sfx=not args.no_sfx, cast_overrides=overrides)
 
     store = JobStore(JobPaths(settings.data_dir, "").db_path)
-    from_stage = Stage(args.from_stage) if args.from_stage else None
     if from_stage is not None:
         job = _previous_job(store, source)
         if job is None:
             print(f"InputError: no previous job for {source.name} under {settings.data_dir}; run without --from-stage first", file=sys.stderr)
             return EXIT_USAGE
+        if job.status == JobStatus.running:
+            print(f"InputError: job {job.id} is running; wait for it to finish before re-running", file=sys.stderr)
+            return EXIT_USAGE
+        if overrides:                                   # the cast stage merges this file over options.cast_overrides
+            paths = JobPaths(settings.data_dir, job.id)
+            merged: dict[str, str] = {}
+            if paths.cast_overrides.is_file():
+                stored = read_json(paths.cast_overrides)
+                if isinstance(stored, dict):
+                    merged.update({str(k): str(v) for k, v in stored.items()})
+            merged.update(overrides)
+            write_json(paths.cast_overrides, merged)
         store.requeue(job.id, from_stage=from_stage)
         JobPaths(settings.data_dir, job.id).manifest.unlink(missing_ok=True)
         print(f"job {job.id}: re-running from stage {from_stage.value}")
@@ -207,9 +241,10 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     except InputError as exc:
         print(f"InputError: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    chapters = parse_chapters(args.chapters)
+    chapters = args.chapters                            # already parsed by argparse (type=parse_chapters)
     if chapters:
         book.chapters = [chapter for chapter in book.chapters if chapter.index in set(chapters)]
+        book.word_count = sum(word_count(paragraph.text) for chapter in book.chapters for paragraph in chapter.paragraphs)
     chunks = sum(len(make_chunks(chapter, settings.analysis_chunk_chars)) for chapter in book.chapters)
     chars = sum(len(paragraph.text) for chapter in book.chapters for paragraph in chapter.paragraphs)
     estimate = Estimate(
@@ -320,14 +355,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-music", action="store_true", help="skip music beds")
     run.add_argument("--no-sfx", action="store_true", help="skip sound effects")
     run.add_argument("--cast", metavar="FILE", help="JSON object of character -> voice id overrides")
-    run.add_argument("--from-stage", choices=[stage.value for stage in STAGE_ORDER], help="re-run the previous job for this file from a stage")
+    run.add_argument(
+        "--from-stage", choices=[stage.value for stage in STAGE_ORDER],
+        help="re-run the previous job for this file from a stage (keeps its title/chapters/music/sfx options; --cast is applied when the cast stage re-runs)",
+    )
     _add_provider_flags(run)
     run.set_defaults(func=cmd_run)
 
     estimate = sub.add_parser("estimate", help="ingest and chunk without calling any provider; print counts and cost")
     estimate.add_argument("file")
     estimate.add_argument("--title")
-    estimate.add_argument("--chapters", help="chapter subset, e.g. 1-2")
+    estimate.add_argument("--chapters", type=parse_chapters, help="chapter subset, e.g. 1-2")
     _add_provider_flags(estimate)
     estimate.set_defaults(func=cmd_estimate)
 

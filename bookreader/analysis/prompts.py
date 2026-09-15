@@ -6,7 +6,8 @@ in :mod:`bookreader.types`, and it ends with the prompt version. It is sent with
 :func:`build_user_message` renders one chunk (bible, mood in force, read-only context, the spans
 to label) and, on the repair pass, the note describing what was wrong with the previous reply.
 The first span of every paragraph listed in ``Chunk.scene_break_paragraphs`` carries a
-``"scene_break": true`` key so the model knows where a new scene starts.
+``"scene_break": true`` key so the model knows where a new scene starts, and a chunk that
+continues an exchange lists ``Chunk.prior_speakers`` so alternation can carry across the cut.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ A name addressed inside a quote ("Hetta," Mara warned) is the addressee, not the
 Give each label one emotion and one delivery from the vocabularies below.
 
 ## Characters
-Add a character entry only for people who speak. Give the full name, aliases (other names, descriptors such as "the stranger" once resolved), gender, age, a one-line description, and voice_notes (timbre words: dry, warm, gravelly, bright...). When a new mention is the same person as an existing bible entry, set merge_into to that entry's canonical name; otherwise merge_into is null.
+Add a character entry only for people who speak. Give the full name, aliases (other names, descriptors such as "the stranger" once resolved), gender, age, a one-line description, and voice_notes (timbre words: dry, warm, gravelly, bright...). When a new mention is the same person as an existing bible entry, set merge_into to that entry's canonical name; otherwise merge_into is the empty string "".
 
 ## Sound effects
 Emit sfx only for concrete audible events described in NARRATION spans, at most 3 per paragraph. anchor_text is copied verbatim from the span (the phrase where the sound happens). kind is "impact" for one-off sounds (thunder, a slam, a bell, a snap, hooves) or "ambient" for continuous ones (wind, rain, the sea, fire, gulls). duration_s is 0.5 to 12 for impacts and 10 to 20 for ambient beds; intensity is 0 to 1; description is a short sound-design prompt.
@@ -80,9 +81,13 @@ def build_user_message(chunk: Chunk, bible: CastBible, repair_note: str | None =
         "## Cast bible (JSON)\n" + bible.to_prompt_json(),
         "## Music mood currently playing\n" + chunk.prior_mood,
         "## Previous paragraphs (context only, already processed)\n" + chunk.context_before,
-        f"## Spans to label (chapter {chunk.chapter_index}, chunk {chunk.chunk_index})\n"
-        + json.dumps(spans, ensure_ascii=False, indent=1),
     ]
+    if chunk.prior_speakers:
+        parts.append("## Most recent speakers before this chunk (earliest first)\n" + ", ".join(chunk.prior_speakers))
+    parts.append(
+        f"## Spans to label (chapter {chunk.chapter_index}, chunk {chunk.chunk_index})\n"
+        + json.dumps(spans, ensure_ascii=False, indent=1)
+    )
     if repair_note:
         parts.append("## Repair note\n" + repair_note)
     return "\n".join(parts)

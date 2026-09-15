@@ -75,7 +75,7 @@ def test_manifest_has_three_chapters_with_equal_length_stems(run: Run) -> None:
     assert manifest.job_id == run.job.id and manifest.title == "The Lighthouse at Gull Point"
     assert [c.index for c in manifest.chapters] == [1, 2, 3]
     assert manifest.total_duration_ms == sum(c.duration_ms for c in manifest.chapters) > 0
-    assert manifest.providers["tts"] == {"family": "mock", "cache_version": "1"}
+    assert manifest.providers["tts"] == {"family": "mock", "cache_version": "1:4"}   # mock tts keys its pacing knob
     assert manifest.cast_file == "cast.json" and manifest.usage_file == "usage.json"
     for chapter in manifest.chapters:
         assert chapter.title.startswith(f"Chapter {chapter.index}")
@@ -170,3 +170,19 @@ def test_chapter_one_mixed_before_chapter_three_renders(run: Run) -> None:
     assert mixed_first < tts_third
     assert [e.stage for e in events if e.message.startswith("stage ") and e.message.endswith(" started")] == [s.value for s in STAGE_ORDER]
     assert all(e.level == "info" for e in events)
+
+
+def test_run_job_is_a_no_op_for_a_job_that_is_not_queued(run: Run) -> None:
+    """A stale queue entry (cancelled, deleted+retried, or already running elsewhere) must not
+    re-run a finished job: run_job claims the row atomically from ``queued`` only."""
+    before = run.store.get_job(run.job.id)
+    assert before is not None and before.status == JobStatus.done
+    events_before = len(run.store.events_after(run.job.id, 0, limit=10_000))
+    again = run_job(run.job.id, run.settings, run.store)
+    assert again.status == JobStatus.done and again.finished_at == before.finished_at and again.started_at == before.started_at
+    assert len(run.store.events_after(run.job.id, 0, limit=10_000)) == events_before
+    assert all(r.attempts == 1 for r in run.store.stage_records(run.job.id))
+    run.store.set_status(run.job.id, JobStatus.running)                      # "another worker holds it"
+    assert run_job(run.job.id, run.settings, run.store).status == JobStatus.running
+    assert len(run.store.events_after(run.job.id, 0, limit=10_000)) == events_before
+    run.store.set_status(run.job.id, JobStatus.done)

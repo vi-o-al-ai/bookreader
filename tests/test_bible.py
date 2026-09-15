@@ -52,6 +52,28 @@ def test_alias_given_by_update_matches_later_updates() -> None:
     assert bible.characters[0].aliases == ["Mara"]
 
 
+def test_alias_naming_a_trait_contradicting_entry_does_not_merge(caplog) -> None:
+    bible = _bible(CharacterEntry(name="Wren", gender="female", age="adult", line_count=3), CharacterEntry(name="the man", gender="male", provisional=True))
+    with caplog.at_level("WARNING", logger="bookreader.analysis.bible"):
+        bible = apply_updates(bible, [CharacterUpdate(name="Corwin Tallow", aliases=["Corwin", "Wren"], gender="male", age="adult")], 1)
+    assert _names(bible) == ["Wren", "the man", "Corwin Tallow"], "a new entry instead of folding a man into Wren"
+    wren = bible.find("Wren")
+    assert wren is not None and wren.name == "Wren" and wren.gender == "female" and wren.aliases == []
+    assert bible.find("Corwin Tallow").name == "Corwin Tallow"
+    assert any("Wren" in record.message and "not merging" in record.message for record in caplog.records)
+
+
+def test_subset_match_requires_agreeing_traits() -> None:
+    bible = _bible(CharacterEntry(name="Ash Carver", gender="male", age="adult"))
+    bible = apply_updates(bible, [CharacterUpdate(name="Ash", gender="female", age="child")], 1)
+    assert _names(bible) == ["Ash Carver", "Ash"]
+    assert bible.find("Ash Carver").gender == "male" and bible.find("Ash Carver").age == "adult"
+    bible = _bible(CharacterEntry(name="Ash Carver", gender="male"))
+    bible = apply_updates(bible, [CharacterUpdate(name="Ash", gender="unknown", age="adult")], 1)
+    assert _names(bible) == ["Ash Carver"], "unknown traits still agree"
+    assert bible.find("Ash Carver").age == "adult"
+
+
 # --------------------------------------------------------------------------- honorifics
 def test_old_hetta_becomes_hetta_with_alias() -> None:
     bible = apply_updates(CastBible(), [CharacterUpdate(name="Old Hetta", gender="female", age="elderly")], 2)
@@ -135,6 +157,19 @@ def test_provisional_not_merged_when_traits_contradict() -> None:
     bible = _bible(CharacterEntry(name="the stranger", gender="male", provisional=True))
     bible = apply_updates(bible, [CharacterUpdate(name="Anna", aliases=["the stranger"], gender="female")], 2)
     assert _names(bible) == ["the stranger", "Anna"]
+
+
+def test_register_speaker_resolves_the_boy_to_the_only_child() -> None:
+    bible = _bible(CharacterEntry(name="Mara Quill", gender="female", age="adult"), CharacterEntry(name="Tobias", gender="male", age="child"))
+    bible, canonical = register_speaker(bible, "the boy", 1)
+    assert canonical == "Tobias" and _names(bible) == ["Mara Quill", "Tobias"] and bible.find("Tobias").line_count == 1
+    bible, canonical = register_speaker(bible, "the girl", 1)
+    assert canonical == "the girl" and bible.characters[-1].provisional, "no female child: a provisional entry as before"
+    two_boys = _bible(CharacterEntry(name="Tobias", gender="male", age="child"), CharacterEntry(name="Kit", gender="male", age="child"))
+    two_boys, canonical = register_speaker(two_boys, "the boy", 1)
+    assert canonical == "the boy", "ambiguous descriptors are not guessed"
+    bible, canonical = register_speaker(_bible(CharacterEntry(name="Ansel Vey", gender="male", age="adult")), "the man", 2)
+    assert canonical == "the man", "generic descriptors stay provisional"
 
 
 def test_descriptor_update_creates_provisional_entry() -> None:

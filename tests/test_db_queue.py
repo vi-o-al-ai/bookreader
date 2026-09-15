@@ -216,12 +216,61 @@ def test_in_process_queue_survives_crashing_job() -> None:
     assert sorted(seen) == ["bad", "good"]
 
 
+def test_in_process_queue_dedupes_pending_ids_and_discard_skips() -> None:
+    """A cancel-then-retry of a queued job submits the same id twice; it must run once. A deleted
+    (discarded) id must be skipped by the worker rather than crash the loop."""
+    gate = threading.Event()
+    seen: list[str] = []
+
+    def run(job_id: str, stop: threading.Event) -> None:
+        seen.append(job_id)
+        gate.wait(5)
+
+    q = InProcessQueue(run, workers=2)
+    q.submit("dup")
+    q.submit("dup")                                       # duplicate while still waiting: no-op
+    q.submit("gone")
+    q.submit("other")
+    assert q.depth() == 3
+    assert q.discard("gone") is True and q.discard("gone") is False and q.discard("never") is False
+    assert q.depth() == 2
+    q.start()
+    deadline = time.monotonic() + 5
+    while len(seen) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)                                       # give a wrong implementation time to run "dup" again
+    assert sorted(seen) == ["dup", "other"] and sorted(q.running()) == ["dup", "other"] and q.depth() == 0
+    q.submit("dup")                                       # a running id may be queued again (retry after cancel)
+    assert q.depth() == 1
+    gate.set()
+    deadline = time.monotonic() + 5
+    while len(seen) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    q.stop(timeout=5)
+    assert seen.count("dup") == 2 and "gone" not in seen
+
+
+def test_claim_moves_only_queued_jobs_to_running(store: JobStore) -> None:
+    job = store.create_job(make_job(), "{}")
+    assert store.claim(job.id) is True
+    assert store.get_job(job.id).status == JobStatus.running  # type: ignore[union-attr]
+    assert store.claim(job.id) is False                   # already running (another worker holds it)
+    store.set_status(job.id, JobStatus.cancelled, error=JobError(stage="queued", error_type="cancelled", message="x", retryable=True))
+    assert store.claim(job.id) is False                   # a stale queue entry of a cancelled job
+    assert store.get_job(job.id).status == JobStatus.cancelled  # type: ignore[union-attr]
+    assert store.claim(job.id, (JobStatus.queued, JobStatus.cancelled)) is True
+    claimed = store.get_job(job.id)
+    assert claimed is not None and claimed.status == JobStatus.running and claimed.error is None and claimed.finished_at is None
+    assert store.claim("missing") is False
+
+
 def test_inline_queue_is_synchronous_and_build_queue_switches() -> None:
     seen: list[str] = []
     q = InlineQueue(lambda job_id, stop: seen.append(job_id))
     q.start()
     q.submit("a")
     assert seen == ["a"] and q.depth() == 0 and q.backend == "inline"
+    assert q.discard("a") is False
     q.stop()
     assert q.stop_event.is_set()
 

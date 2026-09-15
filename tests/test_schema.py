@@ -2,7 +2,10 @@
 that satisfies both the schema and ChunkAnalysis.model_validate."""
 from __future__ import annotations
 
+import copy
 from typing import Any
+
+import pytest
 
 from bookreader.analysis.schema import (
     CHARACTER_SCHEMA,
@@ -22,7 +25,7 @@ SAMPLE: dict[str, Any] = {
     "characters": [
         {
             "name": "Mara Quill", "aliases": ["Mara"], "gender": "female", "age": "adult",
-            "description": "the lighthouse keeper", "voice_notes": "steady, low", "merge_into": None,
+            "description": "the lighthouse keeper", "voice_notes": "steady, low", "merge_into": "",
         },
         {
             "name": "Ansel Vey", "aliases": ["the stranger"], "gender": "male", "age": "adult",
@@ -68,7 +71,7 @@ def test_top_level_shape() -> None:
         prop = CHUNK_ANALYSIS_SCHEMA["properties"][key]
         assert prop["type"] == "array"
         assert prop["items"] is item
-    assert CHARACTER_SCHEMA["properties"]["merge_into"]["type"] == ["string", "null"]
+    assert CHARACTER_SCHEMA["properties"]["merge_into"] == {"type": "string"}, 'nullable is spelled "" (see the adapter)'
     assert CHARACTER_SCHEMA["properties"]["aliases"] == {"type": "array", "items": {"type": "string"}}
     for name in ("duration_s", "intensity"):
         assert SFX_CUE_SCHEMA["properties"][name] == {"type": "number"}
@@ -104,4 +107,29 @@ def test_sample_covers_every_required_key() -> None:
 
 
 def test_prompt_version_is_a_stable_string() -> None:
-    assert PROMPT_VERSION == "2"
+    assert PROMPT_VERSION == "3"
+
+
+def _walk(schema: Any) -> list[Any]:
+    found = [schema]
+    if isinstance(schema, dict):
+        for value in schema.values():
+            found.extend(_walk(value))
+    elif isinstance(schema, list):
+        for value in schema:
+            found.extend(_walk(value))
+    return found
+
+
+def test_schema_uses_only_single_string_types() -> None:
+    """The structured-output grammar takes ``type`` as one basic type; list-form types are not documented and the SDK's normaliser rejects them."""
+    for node in _walk(CHUNK_ANALYSIS_SCHEMA):
+        if isinstance(node, dict) and "type" in node:
+            assert isinstance(node["type"], str), node
+
+
+def test_schema_round_trips_through_the_sdk_normaliser() -> None:
+    pytest.importorskip("anthropic")
+    from anthropic.lib._parse._transform import transform_schema
+
+    transform_schema(copy.deepcopy(CHUNK_ANALYSIS_SCHEMA))

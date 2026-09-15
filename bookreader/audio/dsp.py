@@ -82,11 +82,15 @@ def normalize_rms(
     frame_ms: int = 10,
     voiced_threshold_dbfs: float = -50.0,
     sample_rate: int = SAMPLE_RATE,
+    peak_ceiling_dbfs: float | None = -1.0,
 ) -> np.ndarray:
     """Scale *x* so the RMS of its voiced frames (above *voiced_threshold_dbfs*) hits *target_dbfs*.
 
-    The applied gain never exceeds *max_gain_db*; attenuation is unbounded. A clip with no voiced
-    frame is returned unchanged.
+    The applied gain never exceeds *max_gain_db*, and is also capped so the clip's peak never exceeds
+    *peak_ceiling_dbfs* (``None`` disables the guard); attenuation is unbounded. A clip with no voiced
+    frame is returned unchanged. The peak guard matters for transient-heavy clips (clicks, crackle)
+    whose voiced-frame RMS sits far below their peak: without it the boost would push single samples
+    past full scale and the int16 conversion would hard-clip them into the cache.
     """
     y = to_float(x)
     frame = max(1, ms_to_samples(frame_ms, sample_rate))
@@ -97,6 +101,9 @@ def normalize_rms(
     mask = np.repeat(voiced, frame)[: len(y)]
     measured = rms_dbfs(y[mask])
     gain_db = min(max_gain_db, target_dbfs - measured)
+    peak = float(np.max(np.abs(y)))
+    if peak_ceiling_dbfs is not None and peak > 0.0:
+        gain_db = min(gain_db, peak_ceiling_dbfs - float(_dbfs(peak)))
     return (y * db_to_gain(gain_db)).astype(np.float32)
 
 

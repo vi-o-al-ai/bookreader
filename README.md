@@ -62,7 +62,10 @@ bookreader status JOB_ID [--data-dir DIR]
   `manifest.json`. Exit code 0 on success, 1 when the job failed (the typed error is printed:
   stage, type, unit, message), 2 for a missing / unsupported input or a provider
   configuration problem. `--from-stage` re-runs the most recent job created from the same file
-  (matched by content hash) from that stage onward instead of creating a new one.
+  (matched by content hash) from that stage onward instead of creating a new one; it keeps that
+  job's title, chapters and music/sfx options (passing `--title`, `--chapters`, `--no-music` or
+  `--no-sfx` with it is a usage error), while `--cast` is applied when the cast stage re-runs
+  (`--from-stage cast` or earlier).
 * `estimate` ingests and chunks the book without touching any provider and prints chapters,
   paragraphs, words, chars, quote spans, chunks, TTS chars, estimated analysis tokens and the
   cost per capability from the price table.
@@ -150,7 +153,7 @@ message naming the variable.
 | `BOOKREADER_KOKORO_LANG` | `a` | kokoro language code |
 | `BOOKREADER_MUSICGEN_MODEL` | `facebook/musicgen-small` | local music model |
 | `BOOKREADER_AUDIOGEN_MODEL` | `facebook/audiogen-medium` | local sfx model |
-| `BOOKREADER_LOCAL_SFX_FALLBACK` | `1` | without audiocraft, local sfx falls back to procedural synthesis (warning) instead of failing |
+| `BOOKREADER_LOCAL_SFX_FALLBACK` | `1` | `audiocraft` is in no pip extra (`pip install audiocraft` by hand); without it local sfx falls back to the mock family's procedural synthesis (mock-quality effects, startup warning) instead of failing. `0` makes the missing package a startup error |
 | `BOOKREADER_MOCK_MS_PER_CHAR` | `45` | mock speech pacing (tests use 4) |
 | `BOOKREADER_MP3` | `auto` | `auto` exports mp3 when ffmpeg is on PATH; `off` never |
 | `BOOKREADER_MUSIC_GAIN_DB` | `-14.0` | music bed level |
@@ -174,7 +177,7 @@ per job at creation so a retry renders consistently.
 | `mock` | analysis, tts, music, sfx | (none) | (none) | deterministic sha256-seeded procedural audio and a rule-based analyzer; 16 voices |
 | `anthropic` | analysis | `anthropic` | `ANTHROPIC_API_KEY` | Claude labels spans with a JSON schema, cached system prompt, repair pass and heuristic fallback |
 | `elevenlabs` | tts, music, sfx | `elevenlabs` | `ELEVENLABS_API_KEY` | `text_to_speech.convert` (pcm_22050, previous/next text, seed), `music.compose` (music_v2), `text_to_sound_effects.convert` |
-| `local` | tts, music, sfx | `local` (+ `local-kokoro`) | (none) | Piper (`BOOKREADER_PIPER_VOICES_DIR`) or Kokoro (needs `espeak-ng`) TTS, MusicGen music, AudioGen sfx (or procedural fallback) |
+| `local` | tts, music, sfx | `local` (+ `local-kokoro`) | (none) | Piper (`BOOKREADER_PIPER_VOICES_DIR`) or Kokoro (needs `espeak-ng`) TTS, MusicGen music, AudioGen sfx only after a manual `pip install audiocraft` (no extra installs it; otherwise the procedural mock synth runs under the `local` name, see `BOOKREADER_LOCAL_SFX_FALLBACK`) |
 | | pdf ingest | `pdf` | | `pypdf`, imported lazily |
 
 Families mix freely, e.g. anthropic analysis + elevenlabs speech + mock music. Startup
@@ -199,7 +202,7 @@ data/
     bible.json                       cast bible (characters, aliases, gender/age, line counts)
     scripts/chNN.json                assembled chapter scripts (segments + cues)
     voices.json  cast.json           catalog and voice assignments
-    cast_overrides.json              written by PUT /cast (or --cast)
+    cast_overrides.json              written by PUT /cast or `run --from-stage cast --cast F` (a first run's --cast stays in the job options)
     chapters/NN/
       tts.json                       planned TTS requests, clip keys and measured durations
       timeline.json  render.key      placements + the content key the outputs were rendered from
@@ -231,14 +234,18 @@ Stems (`voice`, `music`, `sfx`) sum to the pre-limiter mix.
   are part of the TTS keys, only the re-cast characters' lines are synthesized again; the
   narrator and everyone else are cache hits, visible as `cache_hits` in `/usage`.
 * **Retry from a stage.** `POST /retry {"from_stage": "analyze"}` resets that stage and every
-  later one; identical inputs still hit the cache, so re-running analysis with the same model
-  costs nothing.
+  later one and forces them to regenerate their outputs even though they exist on disk;
+  identical inputs still hit the cache, so re-running analysis with the same model costs
+  nothing, while a changed analysis provider/model really re-analyzes. Switching the TTS
+  family between runs is detected at cast/render time and re-casts against the new catalog.
 * **Cancellation** is checked between chunks, between TTS/SFX submissions, between chapters
   and before finalize. In-flight provider calls complete and still populate the cache.
 * **Crash / shutdown recovery.** On SIGTERM the worker stops with a 30 s grace period and the
   running job returns to `queued`; on boot the app requeues jobs left `running` or `queued`.
 * **Pruning.** Finalize evicts least-recently-used cache files until the cache fits
-  `BOOKREADER_CACHE_MAX_MB`. Reads bump mtimes, so hot clips survive.
+  `BOOKREADER_CACHE_MAX_MB`. Cache hits bump mtimes, so hot clips survive, and entries used by
+  a job still running on another worker are spared (the cap may be exceeded until it finishes);
+  should a clip vanish anyway, the mix regenerates it from its recorded request.
 
 ## Costs
 
@@ -297,6 +304,10 @@ The image runs as the non-root user `app`, stores everything under the `/data` v
 `WITH_ESPEAK=1` (Kokoro). The `local` family needs torch; use a torch-capable base image for
 GPU inference and mount the piper voices directory
 (`-v ./voices:/voices -e BOOKREADER_PIPER_VOICES_DIR=/voices`).
+AudioGen sound effects need `audiocraft`, which no extra installs (it pins its own torch); add
+`RUN pip install audiocraft` to a derived image, otherwise `EXTRAS=local` ships procedural
+(mock-quality) sound effects under the `local` name. A `.dockerignore` keeps `.venv`, `.git`,
+`data/` and caches out of the build context.
 
 ## Development
 

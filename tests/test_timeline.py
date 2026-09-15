@@ -17,7 +17,7 @@ from bookreader.types import (
 )
 
 from bookreader.audio import timeline as tl
-from bookreader.audio.timeline import TimelineParams, build_timeline
+from bookreader.audio.timeline import DELIVERY_GAIN_DB, TimelineParams, build_timeline
 
 SEG1_TEXT = "Thunder split the sky. Somewhere below, a shutter tore loose and slammed against the wall."
 SEG2_TEXT = "Ring the bell! Ring it now!"
@@ -78,12 +78,14 @@ def make_params(**overrides: object) -> TimelineParams:
 def test_voice_placements_are_sequential_and_paced() -> None:
     timeline = build_timeline(make_script(), make_cast(), make_tts(), make_params())
     voice = [p for p in timeline.placements if p.track == "voice"]
+    segments = {seg.id: seg for seg in make_script().segments}
     assert [p.clip_key for p in voice] == ["k-c1p1s0-0", "k-c1p1s0-1", "k-c1p2s1-0", "k-c1p3s0-0"]
     for a, b in zip(voice, voice[1:]):
         assert a.end_ms <= b.start_ms
     for p in voice:
         assert p.end_ms - p.start_ms == DURATIONS[p.clip_key]
-        assert p.gain_db == 0.0 and p.fade_in_ms == 10 and p.fade_out_ms == 10 and not p.loop and p.duck == "none"
+        assert p.gain_db == DELIVERY_GAIN_DB[segments[p.ref_id].delivery] and p.fade_in_ms == 10 and p.fade_out_ms == 10
+        assert not p.loop and p.duck == "none"
     seg = {t.id: t for t in timeline.segments}
     # blocking gap: music intro 1500 + gap min(0.6*3000, 1500) = 1500 -> first word at 3000
     assert seg["c1p1s0"].start_ms == 3000
@@ -221,3 +223,53 @@ def test_default_music_prompt_covers_all_moods() -> None:
     for mood in MOODS:
         assert tl.default_music_prompt(mood)
     assert tl.default_music_prompt("unknown") == tl.default_music_prompt("calm")
+
+
+def test_voice_gain_follows_delivery() -> None:
+    """Clips are RMS-normalized in the tts substage, so the level dimension of delivery lives in the placement gain."""
+    script = make_script()
+    script.segments[0].delivery = "whisper"
+    script.segments[1].delivery = "shout"
+    script.segments[2].delivery = "quiet"
+    timeline = build_timeline(script, make_cast(), make_tts(), make_params())
+    gain = {p.ref_id: p.gain_db for p in timeline.placements if p.track == "voice"}
+    assert gain["c1p1s0"] < gain["c1p3s0"] < 0.0 < gain["c1p2s1"]
+    assert gain["c1p1s0"] == DELIVERY_GAIN_DB["whisper"] and gain["c1p2s1"] == DELIVERY_GAIN_DB["shout"]
+    assert DELIVERY_GAIN_DB["normal"] == 0.0 and DELIVERY_GAIN_DB["whisper"] > -45.0 + 20.0   # whisper still ducks music
+
+
+def test_repeated_ambient_in_one_scene_extends_the_running_bed() -> None:
+    script = make_script()
+    params = make_params()
+    again = SfxCue(id="c1x004", span_id="c1p3s0", anchor_text="rocks", anchor_offset=SEG3_TEXT.index("rocks"),
+                   description="seagulls crying over rocks", kind="ambient", duration_ms=8000, intensity=0.6, end_span_id="c1p3s0")
+    script = script.model_copy(update={"sfx": script.sfx + [again]})
+    timeline = build_timeline(script, make_cast(), make_tts(), params)
+    ambients = [p for p in timeline.placements if p.track == "sfx" and p.duck == "ambient"]
+    assert len(ambients) == 1 and ambients[0].ref_id == "c1x003"           # no second copy stacked on the first
+    t3 = {t.id: t for t in timeline.segments}["c1p3s0"]
+    assert ambients[0].end_ms == t3.end_ms
+    assert len(timeline.sfx_jobs) == 3                                       # the clip is still requested once
+    # a re-emission after the first bed has ended is a fresh placement
+    later = again.model_copy(update={"span_id": "c1p3s0", "anchor_offset": 0})
+    script2 = make_script()
+    first = script2.sfx[2].model_copy(update={"span_id": "c1p1s0", "anchor_offset": 0, "end_span_id": "c1p1s0"})
+    script2 = script2.model_copy(update={"sfx": [script2.sfx[0], script2.sfx[1], first, later]})
+    timeline2 = build_timeline(script2, make_cast(), make_tts(), params)
+    assert len([p for p in timeline2.placements if p.duck == "ambient"]) == 2
+
+
+def test_unfound_anchor_never_opens_a_blocking_gap() -> None:
+    seg = Segment(id="c1p1s0", paragraph_index=1, speaker=NARRATOR, kind="narration", text=SEG1_TEXT)
+    found = SfxCue(id="x1", span_id="c1p1s0", anchor_text="thunder", anchor_offset=0, description="thunderclap",
+                   kind="impact", duration_ms=3000, intensity=0.9)
+    misquoted = found.model_copy(update={"anchor_text": "Lightning"})       # assemble stores offset 0 when not found
+    empty = found.model_copy(update={"anchor_text": ""})
+    assert tl.anchor_found(found, seg) and tl.is_blocking_impact(found, seg)
+    assert not tl.anchor_found(misquoted, seg) and not tl.is_blocking_impact(misquoted, seg)
+    assert not tl.is_blocking_impact(empty, seg)
+    script = make_script().model_copy(update={"sfx": [misquoted]})
+    timeline = build_timeline(script, make_cast(), make_tts(), make_params())
+    assert timeline.segments[0].start_ms == 1500                             # music intro only, no 1.5 s dead gap
+    impact = next(p for p in timeline.placements if p.track == "sfx")
+    assert impact.start_ms == 1500 - 120                                     # proportional placement, onset lead

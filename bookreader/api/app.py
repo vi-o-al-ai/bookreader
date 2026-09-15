@@ -13,10 +13,10 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from bookreader import __version__
 from bookreader.api.routes import router
@@ -34,6 +34,71 @@ log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 INDEX_HTML = WEB_DIR / "index.html"
 QUEUE_STOP_TIMEOUT_S = 30.0
+MB = 1024 * 1024
+UPLOAD_FORM_OVERHEAD_BYTES = 64 * 1024     # multipart framing plus the title/options fields
+UPLOAD_PATH = "/api/jobs"
+
+ASGIApp = Callable[[dict, Callable, Callable], Awaitable[None]]
+
+
+class UploadLimitMiddleware:
+    """Pure-ASGI guard for ``POST /api/jobs`` (streaming-safe, unlike ``BaseHTTPMiddleware``).
+
+    FastAPI parses the multipart body into an ``UploadFile`` before the endpoint runs, so the
+    endpoint's own byte check would only fire after the whole body was received and spooled to
+    disk. Here a ``Content-Length`` above the limit is answered 413 before any body byte is
+    read, and the ``receive`` callable is wrapped so a body that grows past the limit (chunked,
+    or a lying header) raises ``HTTPException(413)`` from inside the form parser; FastAPI
+    re-raises HTTP exceptions from body parsing untouched and the response goes out before the
+    rest of the body is drained.
+    """
+
+    def __init__(self, app: ASGIApp, limit_bytes: int, path: str = UPLOAD_PATH) -> None:
+        self.app = app
+        self.limit_bytes = int(limit_bytes)
+        self.path = path
+
+    def _guarded(self, scope: dict) -> bool:
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            return False
+        path = str(scope.get("path", ""))
+        root = str(scope.get("root_path", "")).rstrip("/")
+        if root and path.startswith(root):
+            path = path[len(root):]
+        return path.rstrip("/") == self.path
+
+    def _detail(self) -> str:
+        return f"upload exceeds {self.limit_bytes // MB} MB (BOOKREADER_MAX_UPLOAD_MB)"
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        if not self._guarded(scope):
+            await self.app(scope, receive, send)
+            return
+        allowed = self.limit_bytes + UPLOAD_FORM_OVERHEAD_BYTES
+        declared = None
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = None
+                break
+        if declared is not None and declared > allowed:
+            response = JSONResponse({"detail": self._detail()}, status_code=413)
+            await response(scope, receive, send)
+            return
+        received = 0
+
+        async def limited_receive() -> dict:
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > allowed:
+                    raise HTTPException(status_code=413, detail=self._detail())
+            return message
+
+        await self.app(scope, limited_receive, send)
 
 
 def _resubmit_pending(store: JobStore, submit: Callable[[str], None]) -> list[str]:
@@ -88,9 +153,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="bookreader", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.include_router(router)
+    app.add_middleware(UploadLimitMiddleware, limit_bytes=settings.max_upload_mb * MB)
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
         return FileResponse(INDEX_HTML, media_type="text/html; charset=utf-8")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> Response:                     # browsers request it on every load; keep the console and access log clean
+        return Response(status_code=204)
 
     return app

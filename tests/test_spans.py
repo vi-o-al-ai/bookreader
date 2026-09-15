@@ -140,6 +140,27 @@ def test_single_quote_book_with_apostrophes(tmp_path: Path) -> None:
         assert_offsets(p.text, p.spans)
 
 
+def test_single_quote_possessives_and_elisions_do_not_close_the_quote() -> None:
+    cases = {
+        "'Well, come and look at it, then. It's the Hardcastles' pride and joy, or it was.'": [
+            ("quote", "Well, come and look at it, then. It's the Hardcastles' pride and joy, or it was."),
+        ],
+        "'I've seen the boys' room,' said Nell. 'It's a mess.'": [
+            ("quote", "I've seen the boys' room,"), ("narration", "said Nell."), ("quote", "It's a mess."),
+        ],
+        "'Rock 'n' roll,' he said.": [("quote", "Rock 'n' roll,"), ("narration", "he said.")],
+        "'I'm goin' home,' she said.": [("quote", "I'm goin' home,"), ("narration", "she said.")],
+        "'My parents' house is over there,' said Tom.": [("quote", "My parents' house is over there,"), ("narration", "said Tom.")],
+    }
+    for text, expected in cases.items():
+        spans = split_spans(text, 1, 1, "single")
+        assert pairs(spans) == expected, text
+        assert_offsets(text, spans)
+    unbalanced = "'The boys' room is a mess"
+    assert pairs(split_spans(unbalanced, 1, 1, "single")) == [("quote", "The boys"), ("narration", "room is a mess")], \
+        "with no later closer the old rule still applies"
+
+
 def test_single_quote_curly_and_unbalanced() -> None:
     text = "‘Where’s the boy?’ she asked. ‘I don’t know"
     spans = split_spans(text, 1, 1, "single")
@@ -169,6 +190,28 @@ def test_dash_dialogue() -> None:
     narration = "The sea — grey and flat — lay silent."
     assert pairs(split_spans(narration, 1, 1, "dash")) == [("narration", narration)]
     assert_offsets(narration, split_spans(narration, 1, 1, "dash"))
+
+
+def test_dash_dialogue_splits_out_speech_tags_and_narration() -> None:
+    cases = {
+        "— You are late, said Marie.": [("quote", "You are late"), ("narration", ", said Marie.")],
+        "— I always pay, said Tomas.": [("quote", "I always pay"), ("narration", ", said Tomas.")],
+        "— The bells were early, said Tomas. — I set my watch by them.": [
+            ("quote", "The bells were early"), ("narration", ", said Tomas."), ("quote", "I set my watch by them."),
+        ],
+        "— Perhaps. He leaned on the parapet beside her. — Are you going to be angry all evening?": [
+            ("quote", "Perhaps."), ("narration", "He leaned on the parapet beside her."), ("quote", "Are you going to be angry all evening?"),
+        ],
+        "— Decide quickly. The café closes at nine.": [("quote", "Decide quickly. The café closes at nine.")],
+        "— Fine. But you are paying.": [("quote", "Fine. But you are paying.")],
+        "— Two of the usual, said Tomas, and sat down. — And bread.": [
+            ("quote", "Two of the usual"), ("narration", ", said Tomas, and sat down."), ("quote", "And bread."),
+        ],
+    }
+    for text, expected in cases.items():
+        spans = split_spans(text, 1, 1, "dash")
+        assert pairs(spans) == expected, text
+        assert_offsets(text, spans)
 
 
 def test_other_styles_marks_are_left_alone() -> None:

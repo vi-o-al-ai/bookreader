@@ -92,11 +92,45 @@ def test_ducking_lowers_music_under_voice(tmp_path: Path) -> None:
     music = pcm.to_float(pcm.read_wav(paths["music"]).samples)
     s = SAMPLE_RATE // 1000
     under_voice = rms_dbfs(music[3500 * s: 4800 * s])
-    in_gap = rms_dbfs(music[500 * s: 2500 * s])
-    assert in_gap - under_voice >= 6.0
+    # spec: under speech the bed follows its placement gain exactly (0 dB here); long gaps get +5 dB
+    assert abs(under_voice - rms_dbfs(clips["m"].samples)) < 0.5
+    # the impact at 1000-1500 ms splits the opening gap: the 1 s before it is too short to breathe ...
+    before_impact = rms_dbfs(music[200 * s: 900 * s])
+    assert abs(before_impact - under_voice) < 0.5
+    # ... the 1.5 s between the impact and the voice does (release-limited, so only part of the way)
+    in_gap = rms_dbfs(music[2000 * s: 2900 * s])
+    assert in_gap - under_voice >= 2.0
     # the bed recovers after speech ends (long gap -> boosted level, release-limited)
     after = rms_dbfs(music[7000 * s: 8000 * s])
-    assert after - under_voice >= 6.0
+    assert abs((after - under_voice) - mixer.MUSIC_GAP_BOOST_DB) < 0.5
+
+
+def test_music_bed_is_not_ducked_below_its_placement_gain() -> None:
+    assert mixer.MUSIC_DUCK_DB == 0.0
+    env = np.full(300, -80.0)
+    env[100:200] = -20.0
+    n = 300 * SAMPLE_RATE // 50
+    curve = mixer.duck_gain(env, n, mixer.MUSIC_DUCK_DB, gap_boost_db=mixer.MUSIC_GAP_BOOST_DB, min_gap_ms=mixer.MUSIC_GAP_MIN_MS)
+    assert abs(curve[150 * SAMPLE_RATE // 50] - 1.0) < 1e-3
+
+
+def test_duck_gain_lookahead_and_hold() -> None:
+    frame = SAMPLE_RATE // 50
+    env = np.full(200, -80.0)
+    env[100:120] = -20.0
+    n = 200 * frame
+    early = mixer.duck_gain(env, n, 8.0, gap_boost_db=5.0, min_gap_ms=1200)
+    late = mixer.duck_gain(env, n, 8.0, gap_boost_db=5.0, min_gap_ms=1200, lookahead_ms=0)
+    at_onset = 100 * frame + frame // 2
+    assert late[at_onset] > db_to_gain(0.0)                       # no look-ahead: still nearly un-ducked at the onset
+    assert early[at_onset] < db_to_gain(-5.0)                     # look-ahead: already most of the way down
+    assert early[97 * frame + frame // 2] < db_to_gain(5.0) - 0.05 and abs(late[97 * frame + frame // 2] - db_to_gain(5.0)) < 1e-3
+    # frames flagged in `hold` are busy: a 2 s speech-free run covered by an impact earns no boost
+    hold = np.zeros(200, dtype=bool)
+    hold[:100] = True
+    held = mixer.duck_gain(env, n, 8.0, gap_boost_db=5.0, min_gap_ms=1200, hold=hold)
+    assert held[: 100 * frame].max() < db_to_gain(-7.9)
+    assert held[-1] > db_to_gain(0.0)                             # the trailing gap still breathes
 
 
 def test_duck_gain_curve_shape() -> None:
@@ -217,6 +251,15 @@ def test_mix_end_to_end_from_timeline(tmp_path: Path) -> None:
     n = int(round(timeline.duration_ms * SAMPLE_RATE / 1000))
     assert all(len(s) == n for s in stems.values())
     assert np.max(np.abs(stems["music"])) > 0 and np.max(np.abs(stems["sfx"])) > 0
+    # level design: under speech the music stem sits at bed level + music_gain_db (no extra duck)
+    s = SAMPLE_RATE // 1000
+    seg1 = {t.id: t for t in timeline.segments}["c2p1s0"]
+    under_speech = rms_dbfs(pcm.to_float(stems["music"])[(seg1.start_ms + 1000) * s: (seg1.end_ms - 200) * s])
+    bed = rms_dbfs(clips[timeline.music_jobs[0].clip_key].samples)
+    assert abs(under_speech - (bed + params.music_gain_db)) < 1.0
+    # the blocking gap before the first word holds the thunder, so the music must not swell into it
+    gap = rms_dbfs(pcm.to_float(stems["music"])[(seg1.start_ms - 600) * s: (seg1.start_ms - 100) * s])
+    assert gap < bed + params.music_gain_db + 1.0
 
 
 def test_export_mp3_returns_false_without_ffmpeg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

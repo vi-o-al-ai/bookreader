@@ -9,7 +9,10 @@ Besides the job, settings, paths, store, providers, ledger and cache, the contex
 * ``check_cancelled()`` - raises ``JobCancelled('shutdown')`` when the worker's stop event is
   set and ``JobCancelled('user')`` when the store's cancel flag is set (polled at most every
   250 ms unless ``force=True``);
-* ``substage(name)`` - a context manager that names and times a substage in the log.
+* ``substage(name)`` - a context manager that names and times a substage in the log;
+* ``forced`` - the stages that must regenerate their outputs even when they already exist on
+  disk (a retry from that stage, PUT /cast, a stage reset after an earlier attempt);
+  ``ctx.is_forced()`` asks for the current stage.
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import FrozenSet, Iterator
 
 from bookreader.jobs.db import JobStore
 from bookreader.jobs.paths import JobPaths
@@ -87,6 +90,7 @@ class JobContext:
     stop_event: threading.Event = field(default_factory=threading.Event)
     stage: Stage | None = None
     log_filter: JobLogFilter | None = None
+    forced: FrozenSet[Stage] = frozenset()
     _substage: str | None = field(default=None, init=False, repr=False)
     _last_progress_write: float = field(default=0.0, init=False, repr=False)
     _last_cancel_poll: float = field(default=0.0, init=False, repr=False)
@@ -104,6 +108,10 @@ class JobContext:
         """Make the calling thread's log records part of this job's ``job.log`` (executor initializer)."""
         if self.log_filter is not None:
             self.log_filter.threads.add(threading.get_ident())
+
+    def is_forced(self) -> bool:
+        """Whether the current stage must regenerate outputs that already exist (explicit re-run)."""
+        return self.stage is not None and self.stage in self.forced
 
     # ------------------------------------------------------------------ progress
     def progress(self, substage: str, done: int, total: int, message: str = "") -> None:

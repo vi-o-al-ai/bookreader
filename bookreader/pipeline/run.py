@@ -73,14 +73,18 @@ def create_job(
     title: str | None = None,
     options: JobOptions | None = None,
     job_id: str | None = None,
+    filename: str | None = None,
 ) -> Job:
-    """Copy *source* into a fresh job workspace and insert the queued job row."""
+    """Copy *source* into a fresh job workspace and insert the queued job row. *filename* is the
+    name recorded on the job (default: the source file name; the API passes the client's name
+    because it spools uploads under a fixed temp name)."""
     source = Path(source)
     job_id = job_id or new_job_id()
     paths = JobPaths(settings.data_dir, job_id)
     paths.job_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, paths.source(source.suffix.lower()))
-    job = Job(id=job_id, title=title or source.stem, filename=source.name, options=options or JobOptions())
+    filename = filename or source.name
+    job = Job(id=job_id, title=title or Path(filename).stem, filename=filename, options=options or JobOptions())
     return store.create_job(job, settings.snapshot())
 
 
@@ -95,16 +99,27 @@ def _settings_for_job(settings: Settings, store: JobStore, job_id: str) -> Setti
         return settings
 
 
-def _stages_to_run(store: JobStore, job_id: str, from_stage: Stage | None) -> list[Stage]:
+def _stages_to_run(store: JobStore, job_id: str, from_stage: Stage | None) -> tuple[list[Stage], frozenset[Stage]]:
+    """``(stages to run, stages forced to regenerate their outputs)``.
+
+    A stage is *forced* when it is being re-run although it ran before: it sits at or after an
+    explicit *from_stage*, or its record was reset to pending / left failed after an earlier
+    attempt (``store.requeue(from_stage=...)``, PUT /cast, crash recovery). Forced stages must
+    not take the "outputs already exist" shortcut, otherwise a retry from ``analyze`` or
+    ``cast`` would silently keep the old scripts or cast.
+    """
     records = {record.stage: record for record in store.stage_records(job_id)}
     restart_from = STAGE_ORDER.index(from_stage) if from_stage is not None else len(STAGE_ORDER)
     stages: list[Stage] = []
+    forced: set[Stage] = set()
     for position, stage in enumerate(STAGE_ORDER):
         record = records.get(stage)
         if record is not None and record.state == StageState.done and position < restart_from:
             continue
         stages.append(stage)
-    return stages
+        if position >= restart_from or (record is not None and record.attempts > 0):
+            forced.add(stage)
+    return stages, frozenset(forced)
 
 
 def run_job(
@@ -119,36 +134,46 @@ def run_job(
 
     Stages already ``done`` are skipped unless *from_stage* names them (or an earlier stage).
     The returned job is ``done``, ``failed`` (with a typed error), ``cancelled`` (user request)
-    or ``queued`` again (worker shutdown). Raises ``KeyError`` for an unknown job id.
+    or ``queued`` again (worker shutdown). Raises ``KeyError`` for an unknown job id. The job
+    must be ``queued`` (any non-running status when *from_stage* is given): a job that is not
+    claimable is returned untouched, so a stale queue entry is a no-op.
     """
     job = store.get_job(job_id)
     if job is None:
         raise KeyError(f"unknown job id {job_id!r}")
+    from_stage = Stage(from_stage) if isinstance(from_stage, str) else from_stage
+    # Claim the job atomically (queued -> running). A stale queue entry (the job was cancelled,
+    # deleted+recreated, retried while still queued, or is already running on another worker)
+    # fails the claim and is a no-op. An explicit from_stage is a direct caller's request to
+    # re-run a finished job, so any non-running status may be claimed then.
+    claimable = (JobStatus.queued,) if from_stage is None else (JobStatus.queued, JobStatus.done, JobStatus.failed, JobStatus.cancelled)
+    if not store.claim(job_id, claimable):
+        log.info("job %s not claimed: status is %s, not one of %s", job_id, job.status.value, ", ".join(s.value for s in claimable))
+        return store.get_job(job_id) or job
     if job.cancel_requested:
         error = JobError(stage=job.stage.value if job.stage else "queued", error_type="cancelled", message="cancelled before it started", retryable=True)
         store.set_status(job_id, JobStatus.cancelled, error=error)
         return store.get_job(job_id) or job
 
     settings = _settings_for_job(settings, store, job_id)
-    from_stage = Stage(from_stage) if isinstance(from_stage, str) else from_stage
     paths = JobPaths(settings.data_dir, job_id)
     paths.job_dir.mkdir(parents=True, exist_ok=True)
     ledger = UsageLedger(store, job_id, settings.prices)
     handler, log_filter = attach_job_log(job_id, paths.log, settings.log_level)
     stop = stop_event or threading.Event()
-    store.set_status(job_id, JobStatus.running)
     store.update_job(job_id, started_at=job.started_at or now_iso())
     stage: Stage | None = None
     try:
         with UsageRouter.bind(ledger):
             active = providers or build_providers(settings, ledger)
+            stages, forced = _stages_to_run(store, job_id, from_stage)
             ctx = JobContext(
                 job=store.get_job(job_id) or job, settings=settings, paths=paths, store=store, providers=active,
-                ledger=ledger, cache=ClipCache(paths.cache_root), stop_event=stop, log_filter=log_filter,
+                ledger=ledger, cache=ClipCache(paths.cache_root), stop_event=stop, log_filter=log_filter, forced=forced,
             )
             families = ", ".join(f"{cap}={desc['family']}" for cap, desc in active.describe().items())
             ctx.log("info", f"run started (providers: {families})")
-            for stage in _stages_to_run(store, job_id, from_stage):
+            for stage in stages:
                 ctx.stage = stage
                 store.update_job(job_id, stage=stage)
                 store.set_stage(job_id, stage, state=StageState.running, done=0, message="", bump_attempts=True)

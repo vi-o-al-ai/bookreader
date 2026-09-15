@@ -72,13 +72,16 @@ class MockTTS:
     """Deterministic procedural TTS (family ``mock``). Implements ``VoiceSynthesizer``."""
 
     family: ClassVar[str] = "mock"
-    cache_version: str = "1"
+    cache_version: str = "1"        # instances append the pacing knob: "1:<ms_per_char>"
     max_chars: int = 4000
 
     def __init__(self, ms_per_char: int = 45, usage: UsageSink | None = None) -> None:
         if ms_per_char < 1:
             raise ValueError("ms_per_char must be >= 1")
         self.ms_per_char = int(ms_per_char)
+        # ms_per_char changes the rendered audio but is not part of TTSRequest, so it must be part
+        # of the cache key; otherwise clips rendered at one pacing are reused for another.
+        self.cache_version = f"{type(self).cache_version}:{self.ms_per_char}"
         self.usage: UsageSink = usage or NullUsage()
 
     @classmethod

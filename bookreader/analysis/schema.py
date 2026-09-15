@@ -15,7 +15,7 @@ from typing import Any
 
 from bookreader.types import AGES, DELIVERIES, EMOTIONS, GENDERS, MOODS
 
-PROMPT_VERSION = "2"
+PROMPT_VERSION = "3"
 
 SFX_KINDS: tuple[str, ...] = ("impact", "ambient")
 MUSIC_ACTIONS: tuple[str, ...] = ("start", "change", "stop")
@@ -56,7 +56,10 @@ CHARACTER_SCHEMA: dict[str, Any] = _object(
         "age": _enum(AGES),
         "description": {"type": "string"},
         "voice_notes": {"type": "string"},
-        "merge_into": {"type": ["string", "null"]},
+        # a plain string, "" meaning "no merge": the structured-output grammar documents nullable
+        # fields only through anyOf and the SDK's own normaliser rejects the list-form type, so the
+        # adapter maps "" to CharacterUpdate.merge_into = None before validation
+        "merge_into": {"type": "string"},
     }
 )
 

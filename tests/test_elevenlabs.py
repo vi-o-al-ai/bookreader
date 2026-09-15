@@ -2,22 +2,29 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import httpx
 import numpy as np
 import pytest
 
-from bookreader.providers.base import MusicGenerator, SfxGenerator, VoiceSynthesizer
+from bookreader.jobs.db import JobStore
+from bookreader.pipeline.run import create_job, run_job
+from bookreader.providers.base import MusicGenerator, Providers, SfxGenerator, VoiceSynthesizer
 from bookreader.providers.elevenlabs import client as el_client
 from bookreader.providers.elevenlabs.music import ElevenLabsMusic
 from bookreader.providers.elevenlabs.sfx import ElevenLabsSFX
 from bookreader.providers.elevenlabs.tts import ElevenLabsTTS
-from bookreader.retry import FamilyLimiter
+from bookreader.providers.mock.analysis import HeuristicAnalyzer
+from bookreader.retry import FamilyLimiter, with_retry
 from bookreader.settings import Settings
 from bookreader.types import (
     SAMPLE_RATE,
+    JobStatus,
     MusicRequest,
     ProviderConfigError,
     ProviderPermanentError,
@@ -151,21 +158,106 @@ def test_map_error_keeps_bookreader_errors_and_uses_sdk_api_error_shape():
     assert isinstance(el_client.map_error(ApiError(status_code=422, body="bad")), ProviderPermanentError)
 
 
-def test_guarded_call_retries_transient_and_fails_fast_on_permanent():
+def test_guarded_call_maps_errors_and_leaves_retrying_to_the_caller():
+    """guarded_call is the limiter + error-mapping layer only; the pipeline's with_retry is the
+    single retry policy (the SDK's own retries are disabled per request), so one failing unit of
+    work costs at most 4 HTTP attempts and backoff sleeps never hold the family permit."""
     flaky = Recorder(FakeError(503), FakeError(429), "ok")
-    assert el_client.guarded_call(flaky, concurrency=2) == "ok"
-    assert len(flaky.calls) == 3
+    with pytest.raises(ProviderTransientError):
+        el_client.guarded_call(flaky, concurrency=2)
+    assert len(flaky.calls) == 1, "the adapter never retries on its own"
     assert FamilyLimiter.width("elevenlabs") == 2
+    assert with_retry(lambda: el_client.guarded_call(flaky, concurrency=2)) == "ok"
+    assert len(flaky.calls) == 3, "the pipeline-shaped call retries transient failures"
 
     broken = Recorder(FakeError(400))
     with pytest.raises(ProviderPermanentError):
-        el_client.guarded_call(broken, concurrency=2)
+        with_retry(lambda: el_client.guarded_call(broken, concurrency=2))
     assert len(broken.calls) == 1
 
     always_down = Recorder(FakeError(500))
     with pytest.raises(ProviderTransientError):
-        el_client.guarded_call(always_down, concurrency=2)
-    assert len(always_down.calls) == 4  # with_retry default attempts
+        with_retry(lambda: el_client.guarded_call(always_down, concurrency=2))
+    assert len(always_down.calls) == 4  # with_retry default attempts: the whole budget
+    assert el_client.NO_SDK_RETRIES == {"max_retries": 0}
+
+
+def _sem_value(family: str = "elevenlabs") -> int:
+    return FamilyLimiter.get(family, 1)._value  # type: ignore[attr-defined]
+
+
+def _pipeline_shaped_calls(width: int) -> list[Any]:
+    """Each adapter method exactly as bookreader.pipeline.stages calls it: with_retry only, no
+    outer FamilyLimiter (the adapter owns the family semaphore)."""
+    raw = sine_pcm(20)[1]
+    search = Recorder(page([voice("v1", "A", {"gender": "female"})], False, None))
+    tts = ElevenLabsTTS(fake_client(convert=Recorder(lambda: chunked(raw)), voices=types.SimpleNamespace(search=search)), concurrency=width)
+    music = ElevenLabsMusic(fake_client(compose=Recorder(lambda: chunked(raw))), concurrency=width)
+    sfx = ElevenLabsSFX(fake_client(sfx=Recorder(lambda: chunked(raw))), concurrency=width)
+    return [
+        lambda: with_retry(tts.list_voices),
+        lambda: with_retry(lambda: tts.synthesize(TTSRequest(text="Hi.", voice_id="v1"))),
+        lambda: with_retry(lambda: music.compose(MusicRequest(prompt="p"))),
+        lambda: with_retry(lambda: sfx.generate(SfxRequest(description="x"))),
+    ]
+
+
+def test_family_semaphore_is_acquired_exactly_once_per_call_at_width_one():
+    """Regression: the pipeline used to acquire the same family semaphore around every adapter
+    call, so each request needed two permits and BOOKREADER_CONCURRENCY=1 hung forever."""
+    for call in _pipeline_shaped_calls(width=1):
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive(), "adapter call blocked on the family semaphore"
+        assert _sem_value() == 1, "the permit is released after the call"
+
+
+def test_family_semaphore_width_is_the_real_parallelism():
+    """Four workers at width 4 must all be in flight at once (two permits per call halved it)."""
+    width = 4
+    in_flight = threading.Barrier(width, timeout=5)
+
+    def convert(*_a: Any, **_k: Any) -> bytes:
+        in_flight.wait()                      # times out (BrokenBarrierError) unless 4 run together
+        return sine_pcm(10)[1]
+
+    tts = ElevenLabsTTS(fake_client(convert=convert), concurrency=width)
+    with ThreadPoolExecutor(max_workers=width) as pool:
+        futures = [pool.submit(lambda: with_retry(lambda: tts.synthesize(TTSRequest(text="Hi.", voice_id="v")))) for _ in range(width * 2)]
+        clips = [f.result(timeout=10) for f in futures]
+    assert len(clips) == width * 2 and all(c.duration_ms == 10 for c in clips)
+    assert _sem_value() == width
+
+
+@pytest.mark.timeout(30)
+def test_run_job_with_elevenlabs_adapters_at_concurrency_one_completes(tmp_path: Path, sample_book_path: Path) -> None:
+    """End to end through run_job (cast -> list_voices, render -> synthesize/compose/generate)
+    with BOOKREADER_CONCURRENCY=1 against fake SDK clients: this hung at the cast stage before
+    the pipeline stopped nesting the family semaphore around adapter calls."""
+    raw = sine_pcm(200)[1]
+    catalog = [
+        voice(f"v{i}", f"Voice {i}", {"gender": "female" if i % 2 else "male", "age": "middle_aged"}) for i in range(12)
+    ]
+    search = Recorder(page(catalog, False, None))
+    convert = Recorder(lambda: chunked(raw))
+    compose = Recorder(lambda: chunked(raw))
+    sfx_convert = Recorder(lambda: chunked(raw))
+    client = fake_client(convert=convert, compose=compose, sfx=sfx_convert, voices=types.SimpleNamespace(search=search))
+    providers = Providers(
+        analysis=HeuristicAnalyzer(),
+        tts=ElevenLabsTTS(client, concurrency=1),
+        music=ElevenLabsMusic(client, concurrency=1),
+        sfx=ElevenLabsSFX(client, concurrency=1),
+    )
+    settings = Settings.from_env({}).with_overrides(data_dir=tmp_path / "data", worker_mode="inline", warmup=False, concurrency=1)
+    store = JobStore(settings.data_dir / "bookreader.db")
+    job = create_job(store, settings, sample_book_path)
+    done = run_job(job.id, settings, store, providers=providers)
+    assert done.status == JobStatus.done, done.error
+    assert len(search.calls) == 1 and convert.calls and compose.calls and sfx_convert.calls
+    assert all(c[1]["request_options"] == {"max_retries": 0} for c in [*convert.calls, *compose.calls, *sfx_convert.calls, *search.calls])
+    assert _sem_value() == 1
 
 
 def test_check_and_make_client_name_the_extra_when_sdk_is_missing(monkeypatch: pytest.MonkeyPatch):
@@ -259,8 +351,12 @@ def test_tts_maps_api_errors_and_records_usage_only_on_success():
     tts = ElevenLabsTTS(fake_client(convert=convert), usage=usage)
     with pytest.raises(ProviderTransientError) as exc:
         tts.synthesize(TTSRequest(text="Hi.", voice_id="v"))
-    assert exc.value.retry_after is None  # the last attempt's error carried no Retry-After header
-    assert len(convert.calls) == 4 and usage.rows == []
+    assert exc.value.retry_after == 1.0  # Retry-After is carried for the pipeline's with_retry
+    assert len(convert.calls) == 1 and usage.rows == []
+    with pytest.raises(ProviderTransientError) as exc2:
+        with_retry(lambda: tts.synthesize(TTSRequest(text="Hi.", voice_id="v")))
+    assert exc2.value.retry_after is None  # the last attempt's error carried no Retry-After header
+    assert len(convert.calls) == 5 and usage.rows == []
 
     permanent = ElevenLabsTTS(fake_client(convert=Recorder(FakeError(422))), usage=usage)
     with pytest.raises(ProviderPermanentError):
@@ -290,7 +386,7 @@ def test_list_voices_normalizes_labels_and_tolerates_none():
     assert (out["v3"].gender, out["v3"].age) == ("female", "elderly") and "raspy" in out["v3"].tags
     assert (out["v4"].gender, out["v4"].age) == ("male", "young_adult") and "audiobook" in out["v4"].tags
     assert (out["v5"].gender, out["v5"].age) == ("nonbinary", "unknown")
-    assert search.calls[0][1] == {"page_size": 100, "next_page_token": None}
+    assert search.calls[0][1] == {"page_size": 100, "next_page_token": None, "request_options": {"max_retries": 0}}
 
 
 def test_list_voices_pages_until_max_voices():
@@ -331,7 +427,7 @@ def test_music_compose_clamps_and_passes_model_kwargs():
     np.testing.assert_array_equal(clip.samples, samples)
     kw = compose.calls[0][1]
     assert kw == {"prompt": "slow strings, tense", "music_length_ms": 3000, "model_id": "music_v2",
-                  "force_instrumental": True, "output_format": "pcm_22050"}
+                  "force_instrumental": True, "output_format": "pcm_22050", "request_options": {"max_retries": 0}}
     music.compose(MusicRequest(prompt="p", duration_ms=10_000_000))
     assert compose.calls[1][1]["music_length_ms"] == 600_000
     music.compose(MusicRequest(prompt="p", duration_ms=45_000))
@@ -346,7 +442,10 @@ def test_music_errors_are_mapped():
     with pytest.raises(ProviderPermanentError):
         music.compose(MusicRequest(prompt="p"))
     flaky = Recorder(FakeError(502), lambda: chunked(sine_pcm(10)[1]))
-    assert ElevenLabsMusic(fake_client(compose=flaky)).compose(MusicRequest(prompt="p")).duration_ms == 10
+    flaky_music = ElevenLabsMusic(fake_client(compose=flaky))
+    with pytest.raises(ProviderTransientError):
+        flaky_music.compose(MusicRequest(prompt="p"))
+    assert with_retry(lambda: flaky_music.compose(MusicRequest(prompt="p"))).duration_ms == 10
     assert len(flaky.calls) == 2
 
 
@@ -364,7 +463,8 @@ def test_sfx_generate_clamps_duration_and_passes_kwargs():
     clip = sfx.generate(SfxRequest(description="a single deep thunderclap", duration_ms=3000, loop=False))
     np.testing.assert_array_equal(clip.samples, samples)
     assert convert.calls[0][1] == {"text": "a single deep thunderclap", "duration_seconds": 3.0, "prompt_influence": 0.5,
-                                   "loop": False, "model_id": "eleven_text_to_sound_v2", "output_format": "pcm_22050"}
+                                   "loop": False, "model_id": "eleven_text_to_sound_v2", "output_format": "pcm_22050",
+                                   "request_options": {"max_retries": 0}}
     sfx.generate(SfxRequest(description="tick", duration_ms=100))
     assert convert.calls[1][1]["duration_seconds"] == 0.5
     sfx.generate(SfxRequest(description="rain", kind="ambient", duration_ms=120_000, loop=True))

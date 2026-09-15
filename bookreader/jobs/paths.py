@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,18 +24,38 @@ CHAPTER_DIR_FORMAT = "{index:02d}"
 SCRIPT_FORMAT = "ch{index:02d}.json"
 RENDER_KEY_FILENAME = "render.key"
 
+_UMASK = os.umask(0)          # read once at import (os.umask is process-wide, not thread-safe)
+os.umask(_UMASK)
+
+
+def open_temp_beside(path: Path) -> tuple[int, Path]:
+    """A uniquely named, exclusively created temp file next to *path* for an atomic replace.
+
+    ``mkstemp`` gives every caller its own name, so concurrent writers of the same target (the
+    worker threads of one process share a pid) never truncate or unlink each other's file: the
+    last ``os.replace`` wins and readers only ever see complete files. The mode follows the
+    process umask like an ordinary ``open`` would (mkstemp itself creates 0600 files).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o666 & ~_UMASK)
+    except OSError:
+        pass
+    return fd, Path(tmp_name)
+
 
 def atomic_write_bytes(path: Path, data: bytes) -> Path:
     """Write *data* to *path* atomically; the parent directory is created when missing."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd, tmp = open_temp_beside(path)
     try:
-        tmp.write_bytes(data)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
         os.replace(tmp, path)
     finally:
-        if tmp.exists():
-            tmp.unlink()
+        tmp.unlink(missing_ok=True)
     return path
 
 

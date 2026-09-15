@@ -135,6 +135,18 @@ def test_each_voice_has_a_distinct_dominant_f0_and_groups_are_ordered(tts: MockT
     assert min(child) > max(female) > min(female) > max(male)
 
 
+def test_ms_per_char_is_part_of_the_cache_version() -> None:
+    from bookreader.settings import JOB_SNAPSHOT_FIELDS
+    from bookreader.types import clip_key
+
+    req = TTSRequest(text="Hello there.", voice_id="mock-narrator-neutral")
+    slow, fast = MockTTS(ms_per_char=60), MockTTS(ms_per_char=4)
+    assert slow.cache_version != fast.cache_version
+    assert clip_key("tts", "mock", slow.cache_version, req) != clip_key("tts", "mock", fast.cache_version, req)
+    assert MockTTS(ms_per_char=4).cache_version == fast.cache_version
+    assert "mock_ms_per_char" in JOB_SNAPSHOT_FIELDS               # a retry keeps the pacing it was created with
+
+
 def test_ms_per_char_scales_duration_linearly() -> None:
     req = TTSRequest(text=SENTENCE, voice_id="mock-f-adult-warm")
     slow = MockTTS(ms_per_char=8).synthesize(req).samples
@@ -182,7 +194,7 @@ def test_tts_provider_contract(mock_settings: Settings) -> None:
     provider = MockTTS.from_settings(mock_settings, NullUsage())
     assert isinstance(provider, VoiceSynthesizer)
     assert provider.ms_per_char == mock_settings.mock_ms_per_char == 4
-    assert MockTTS.family == "mock" and provider.cache_version == "1" and provider.max_chars == 4000
+    assert MockTTS.family == "mock" and provider.cache_version == f"1:{provider.ms_per_char}" and provider.max_chars == 4000
     assert MockTTS.check(mock_settings) == []
     assert provider.warmup() is None
     default = MockTTS.from_settings(Settings.from_env({}))
@@ -241,6 +253,26 @@ def test_energy_scales_music_level() -> None:
     soft = synth.music_bed("warm", 0.1, 3000, 5)
     loud = synth.music_bed("warm", 0.9, 3000, 5)
     assert _rms(loud) > _rms(soft)
+
+
+@pytest.mark.parametrize("mood", ["calm", "sad", "romantic", "ominous"])
+def test_pad_beds_do_not_dip_at_chord_changes(mood: str) -> None:
+    from bookreader.audio.dsp import rms_envelope
+
+    recipe = synth._MOOD_RECIPES[mood]
+    energy = 0.5
+    beat = 60.0 / (recipe.tempo * (0.85 + 0.3 * energy))
+    chord_len = round(8 * beat * SAMPLE_RATE)
+    bed = synth.music_bed(mood, energy, 30000, 1)
+    env = rms_envelope(bed, 10)
+    body = env[30:-30]                                            # skip the 200 ms edge fades
+    median = float(np.median(body))
+    frame = round(10 * SAMPLE_RATE / 1000)
+    seams = [c * chord_len for c in range(1, len(bed) // chord_len + 1) if c * chord_len < len(bed) - 300 * SAMPLE_RATE // 1000]
+    assert seams, "bed shorter than one chord"
+    for seam in seams:
+        around = env[seam // frame - 3: seam // frame + 4]
+        assert around.min() > median - 6.0, (mood, seam, around.min(), median)
 
 
 def test_music_odd_lengths_and_unknown_mood() -> None:

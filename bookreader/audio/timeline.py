@@ -2,7 +2,8 @@
 
 ``build_timeline`` turns a ChapterScript, the cast and the measured TTS clip durations into a
 ChapterTimeline: sequential voice placements with pacing pauses, word-anchored SFX (with a
-blocking-gap mode for loud impacts that open a sentence), looped ambient beds, overlapping music
+blocking-gap mode for loud impacts that open a sentence) with a per-delivery gain offset (whisper
+quieter than shout on top of the normalized clips), looped ambient beds, overlapping music
 regions, and the MusicJob/SfxJob requests whose clip keys the cache and the mix stage share.
 It performs no I/O and uses no randomness beyond ``stable_seed``.
 """
@@ -46,6 +47,11 @@ PAUSE_MAX_MS = 2500
 EMOTION_PAUSE_MULTIPLIER: dict[str, float] = {"urgent": 0.6, "hesitant": 1.3, "melancholy": 1.3, "weary": 1.3}
 VOICE_FADE_MS = 10
 OUTRO_MS = 2500                   # tail after the last voice/sfx end
+# Delivery offsets applied at placement time. TTS clips are RMS-normalized to one target in the
+# tts substage (so cached clips stay reusable and the cache keys unchanged); without an offset a
+# whisper would mix exactly as loud as a shout. -8 dB keeps a whisper well above the mixer's
+# -45 dBFS voice-presence threshold (ducking still engages) and its peaks below normal speech.
+DELIVERY_GAIN_DB: dict[str, float] = {"normal": 0.0, "strained": 0.0, "quiet": -4.0, "whisper": -8.0, "shout": 3.0}
 
 # --------------------------------------------------------------------------- sfx rules
 SFX_ONSET_LEAD_MS = 120           # impacts start slightly before their anchor word
@@ -132,9 +138,26 @@ def pause_before_ms(prev: Segment, seg: Segment) -> int:
     return int(_clamp(round(scaled), PAUSE_MIN_MS, PAUSE_MAX_MS))
 
 
+def anchor_found(cue: SfxCue, seg: Segment) -> bool:
+    """True when ``cue.anchor_offset`` really points at ``cue.anchor_text`` inside the span.
+
+    assemble stores offset 0 when the anchor text was not found (a misquoted anchor), which is
+    indistinguishable from "the sound opens the sentence" by the offset alone.
+    """
+    if not cue.anchor_text:
+        return False
+    return seg.text.lower().startswith(cue.anchor_text.lower(), cue.anchor_offset)
+
+
 def is_blocking_impact(cue: SfxCue, seg: Segment) -> bool:
-    """True when a loud impact opens a narration sentence and must precede the words instead of overlapping them."""
+    """True when a loud impact opens a narration sentence and must precede the words instead of overlapping them.
+
+    An impact whose anchor text was not located in the span is never blocking: a fallback offset of 0
+    says nothing about where the sound belongs, and a wrongly inserted 1.5 s gap is worse than an overlap.
+    """
     if cue.kind != "impact" or cue.intensity < BLOCKING_INTENSITY or seg.kind != "narration":
+        return False
+    if not anchor_found(cue, seg):
         return False
     length = len(seg.text)
     fraction = cue.anchor_offset / length if length else 0.0
@@ -228,7 +251,7 @@ def build_timeline(script: ChapterScript, cast: Cast, tts: ChapterTts, params: T
                 duration = 0
             voice.append(Placement(
                 track="voice", clip_key=job.clip_key, ref_id=seg.id, start_ms=cursor, end_ms=cursor + duration,
-                gain_db=0.0, fade_in_ms=VOICE_FADE_MS, fade_out_ms=VOICE_FADE_MS,
+                gain_db=DELIVERY_GAIN_DB.get(seg.delivery, 0.0), fade_in_ms=VOICE_FADE_MS, fade_out_ms=VOICE_FADE_MS,
             ))
             cursor += duration
         timings.append(SegmentTiming(id=seg.id, start_ms=start, end_ms=cursor))
@@ -237,6 +260,7 @@ def build_timeline(script: ChapterScript, cast: Cast, tts: ChapterTts, params: T
     timing_by_id = {t.id: t for t in timings}
     sfx: list[Placement] = []
     sfx_jobs: dict[str, SfxJob] = {}
+    active_ambient: dict[str, int] = {}     # clip_key -> index in `sfx` of its running placement
     for cue in script.sfx:
         seg = segments_by_id.get(cue.span_id)
         if not params.sfx_enabled or seg is None:
@@ -249,6 +273,14 @@ def build_timeline(script: ChapterScript, cast: Cast, tts: ChapterTts, params: T
             end_timing = timing_by_id.get(cue.end_span_id or "", timing)
             start_ms = max(0, _anchor_ms(cue, timing, seg) - AMBIENT_LEAD_MS)
             end_ms = max(start_ms, end_timing.end_ms)
+            running = active_ambient.get(key)
+            if running is not None and sfx[running].end_ms >= start_ms:
+                # The same bed is still playing (the analysis re-emitted it inside one scene): extend
+                # it instead of stacking a second, differently phased copy of the same clip on top.
+                log.debug("chapter %d: ambient cue %s extends running %s", script.chapter_index, cue.id, sfx[running].ref_id)
+                sfx[running] = sfx[running].model_copy(update={"end_ms": max(sfx[running].end_ms, end_ms)})
+                continue
+            active_ambient[key] = len(sfx)
             sfx.append(Placement(
                 track="sfx", clip_key=key, ref_id=cue.id, start_ms=start_ms, end_ms=end_ms,
                 gain_db=params.sfx_gain_db + AMBIENT_GAIN_OFFSET_DB, fade_in_ms=AMBIENT_FADE_IN_MS,

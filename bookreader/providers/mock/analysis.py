@@ -71,6 +71,8 @@ STOPWORDS: frozenset[str] = frozenset(
     October November December Monday Tuesday Wednesday Thursday Friday Saturday Sunday Spring Summer
     Autumn Winter Fall North South East West Ring Stand Leave Words First Second Third Last Next Nine
     Ten Old Young Mr Mrs Ms Miss Dr Doctor Captain Aunt Uncle Lady Lord Dear Come
+    Nonsense Careful Impossible Quiet Hurry Listen Silence Damn Hmm Exactly Absolutely Wonderful Ready
+    Attack Charge Liar Coward Fool Idiot Brother Sister Friends Ladies Gentlemen Darling Lieutenant Sergeant
     """.split()
 )
 
@@ -91,6 +93,12 @@ DESCRIPTOR_TAG_RE = re.compile(rf"\b(?P<desc>{DESCRIPTOR_PHRASE})\s+(?P<verb>{VE
 DESCRIPTOR_RE = re.compile(rf"\b(?P<desc>{DESCRIPTOR_PHRASE})\b", re.I)
 LEADING_PRONOUN_RE = re.compile(r"(?P<pron>he|she)\b", re.I)
 GENDER_PRONOUN_RE = re.compile(r"\b(?:(?P<male>he|his)|(?P<female>she|her))\b", re.I)
+SENTENCE_PRONOUN_RE = re.compile(r"(?:He|She|His|Her|Him|Himself|Herself|They|Their|It|Its)$")
+KINSHIP_RE = re.compile(
+    r"\b(?:(?P<female>sister|mother|aunt|wife|daughter|niece|grandmother|widow|mrs|ms|miss|lady|madam)"
+    r"|(?P<male>brother|father|uncle|husband|son|nephew|grandfather|widower|mr|sir|lord))\.?\s+$",
+    re.I,
+)
 DESCRIPTION_RE = re.compile(rf"{NAME_RUN}(?:, who [^,.;]+|,? (?:was|is|were) [^,.;]+)")
 TIME_TRANSITION_RE = re.compile(
     r"^(?:Later|Afterwards|Meanwhile|That (?:night|evening|morning)|The next|A (?:week|day|month|year)|"
@@ -98,6 +106,7 @@ TIME_TRANSITION_RE = re.compile(
 )
 REPLY_CUE_RE = re.compile(r"\b(?:repl(?:y|ied|ies)|answer(?:ed|s)?|respon(?:se|ded))\b", re.I)
 NAME_QUESTION_RE = re.compile(r"\b(?:your name|who are you)\b", re.I)
+SELF_INTRO_RE = re.compile(rf"\b(?i:my name is|my name's|the name's|i am|i'm|call me)\s+(?P<first>{NAME_RUN})(?:\.\s*(?P<second>{NAME_RUN}))?")
 SENTENCE_END_RE = re.compile(r"[.!?][\"'”’)]*\s*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 VOCATIVE_RE = re.compile(r"^(?P<name>[A-Z][\w']+)[!,]$")
@@ -226,6 +235,7 @@ class _Character:
     bible_name: str | None = None          # canonical name in the bible when the chunk began
     mentions: int = 0
     attributed: int = 0
+    gender_guessed: bool = False           # gender came from a nearby pronoun, not a kinship word or honorific
 
     def keys(self) -> set[str]:
         return {normalize_name(self.name), *(normalize_name(a) for a in self.aliases)} - {""}
@@ -280,6 +290,8 @@ class _Conversation:
         self.mention(character)
         self.speakers = [s for s in self.speakers if s is not character] + [character]
         del self.speakers[:-2]
+        if self.addressee is character:
+            self.addressee = None          # the vocative predicted this turn; alternation takes over again
 
     def by_pronoun(self, gender: str) -> _Character | None:
         found = self.by_gender.get(gender)
@@ -291,11 +303,12 @@ class _Conversation:
             return self.last_mention
         return None
 
-    def partner(self, speaker: _Character | None) -> tuple[_Character | None, int]:
-        """The person *speaker* is talking to and how many candidates there were."""
-        if self.addressee is not None and self.addressee is not speaker:
+    def partner(self, speaker: _Character | None, exclude: _Character | None = None) -> tuple[_Character | None, int]:
+        """The person *speaker* is talking to and how many candidates there were; *exclude* is
+        the character the quote being attributed addresses, who cannot be its speaker."""
+        if self.addressee is not None and self.addressee is not speaker and self.addressee is not exclude:
             return self.addressee, 1
-        others = [p for p in reversed(self.participants) if p is not speaker]
+        others = [p for p in reversed(self.participants) if p is not speaker and p is not exclude]
         if not others:
             return None, 0
         return others[0], len(others)
@@ -363,6 +376,7 @@ class _ChunkRun:
     def __init__(self, chunk: Chunk, bible: CastBible) -> None:
         self.chunk = chunk
         self.paragraphs = _paragraphs_of(chunk)
+        self.bible = bible
         self.characters: list[_Character] = [
             _Character(
                 name=entry.name,
@@ -384,6 +398,8 @@ class _ChunkRun:
         self.reset_paragraphs: set[int] = set()      # where the conversation restarted; a mood change there needs no look-ahead
         all_text = chunk.context_before + " " + " ".join(s.text for s in chunk.spans)
         self.token_counts: Counter[str] = Counter(WORD_RE.findall(all_text))
+        narration = QUOTED_RE.sub(" ", chunk.context_before) + " " + " ".join(s.text for s in chunk.spans if s.kind == "narration")
+        self.narration_tokens: frozenset[str] = frozenset(NAME_TOKEN_RE.findall(narration))   # capitalised words outside quotes
 
     # ------------------------------------------------------------------ driver
     def run(self) -> ChunkAnalysis:
@@ -393,6 +409,7 @@ class _ChunkRun:
             self.reset_paragraphs.add(self.paragraphs[0].index)
         else:
             self._seed_from_context(self.chunk.context_before)
+            self._seed_speakers(self.chunk.prior_speakers)
         for paragraph in self.paragraphs:
             self._process_paragraph(paragraph)
         return ChunkAnalysis(
@@ -459,9 +476,11 @@ class _ChunkRun:
     def _resolve_descriptor(self, phrase: str, text: str, pos: int, *, create: bool) -> _Character | None:
         key = " ".join(phrase.lower().split())
         gender, age = DESCRIPTOR_TRAITS[key]
-        direct = self._lookup(key)
-        if direct is not None:
-            return direct
+        # 'the man' names the man of this scene: an entry created or renamed in this chunk, a provisional entry,
+        # or a bible character who is in the conversation; a bible alias alone does not reach into a new scene
+        for direct in (c for c in self.characters if key in c.keys()):
+            if direct.provisional or direct.bible_name is None or direct in self.conv.participants:
+                return direct
         if gender == UNKNOWN:
             found = GENDER_PRONOUN_RE.search(text, pos, pos + PRONOUN_WINDOW)
             if found:
@@ -491,11 +510,35 @@ class _ChunkRun:
             return True
         return prev_span.text.rstrip().endswith((".", "!", "?"))
 
+    @staticmethod
+    def _pronoun_window(text: str, end: int) -> str:
+        """The text after a name mention in which a pronoun may still refer to it: up to
+        PRONOUN_WINDOW chars, cut at the next capitalised word that reads as another person's
+        name (mid-sentence and not a stopword, or opening a sentence and not a pronoun)."""
+        window = text[end:end + PRONOUN_WINDOW]
+        for match in NAME_TOKEN_RE.finditer(window):
+            before = window[:match.start()]
+            if not before.strip():
+                continue                                   # a further token of the name itself
+            if match.group(0) in STOPWORDS:
+                continue
+            sentence_initial = bool(SENTENCE_END_RE.search(before))
+            if sentence_initial and SENTENCE_PRONOUN_RE.match(match.group(0)):
+                continue                                   # 'Dorian set the cups. His sister...' still describes Dorian
+            return window[:match.start()]
+        return window
+
     def _infer_traits(self, character: _Character, text: str, start: int, end: int) -> None:
+        if character.gender == UNKNOWN or character.gender_guessed:
+            kin = KINSHIP_RE.search(text, 0, start) or KINSHIP_RE.search(text[start:end].split()[0] + " ")
+            if kin:
+                character.gender = "male" if kin.group("male") else "female"     # 'His sister Petra', 'Mrs Hardcastle'
+                character.gender_guessed = False
         if character.gender == UNKNOWN:
-            found = GENDER_PRONOUN_RE.search(text, end, end + PRONOUN_WINDOW)
+            found = GENDER_PRONOUN_RE.search(self._pronoun_window(text, end))
             if found:
                 character.gender = "male" if found.group("male") else "female"
+                character.gender_guessed = True
         if character.age == UNKNOWN:
             window = DESCRIPTOR_RE.sub("", _first_sentence(text[end:end + AGE_WINDOW]))
             for pattern, age in AGE_WORDS:
@@ -537,13 +580,68 @@ class _ChunkRun:
                 if create:
                     character.mentions += 1
                 self.conv.mention(character)
+        self._prefer_subjects(text)
+
+    def _prefer_subjects(self, text: str) -> None:
+        """Re-derive the 'last mentioned entity per gender' sentence by sentence so that a
+        sentence's subject ('Halloran ... He put his hand on Brannock's shoulder.') outranks the
+        objects and possessives after it; a later sentence with no subject of that gender still
+        falls back to its most recent mention ('... in Ansel's shaking hands.' -> 'he')."""
+        running = dict(self.conv.by_gender)
+        for sentence in SENTENCE_SPLIT_RE.split(text):
+            sentence = sentence.strip()
+            subject: _Character | None = None
+            match = NAME_RUN_RE.match(sentence)
+            if match:
+                subject = self._resolve_name(match.group(0), create=False)
+            if subject is None:
+                match = DESCRIPTOR_RE.match(sentence)
+                if match:
+                    subject = self._resolve_descriptor(match.group("desc"), sentence, match.end(), create=False)
+            if subject is None:
+                match = LEADING_PRONOUN_RE.match(sentence)
+                if match:
+                    subject = running.get("male" if match.group("pron").lower() == "he" else "female")
+            for name in NAME_RUN_RE.finditer(sentence):
+                character = self._resolve_name(name.group(0), create=False)
+                if character is not None and character.gender != UNKNOWN:
+                    running[character.gender] = character
+            if subject is not None and subject.gender != UNKNOWN:
+                running[subject.gender] = subject
+        self.conv.by_gender.update(running)
 
     def _seed_from_context(self, context: str) -> None:
         if not context.strip():
             return
         self._scan(context, create=False)
+        self._seed_names(context)
         quotes = QUOTED_RE.findall(context)
         self.conv.last_quote = quotes[-1] if quotes else context.split("\n\n")[-1]
+
+    def _seed_names(self, context: str) -> None:
+        """Names the previous chunk may not have emitted yet (one mention, no line) are re-created
+        from the context when they are clearly people (two tokens or an honorific), without counting
+        as mentions: a tag in this chunk then resolves 'Dorian' to 'Dorian Ash' with its description."""
+        narration = QUOTED_RE.sub(" ", context)
+        for match in NAME_RUN_RE.finditer(narration):
+            raw = match.group(0)
+            if self._resolve_name(raw, create=False) is not None:
+                continue
+            cleaned, honorific_form = strip_honorific(POSSESSIVE_RE.sub("", raw))
+            tokens = [t for t in cleaned.split() if t not in STOPWORDS]
+            if len(tokens) < 2 and honorific_form is None:
+                continue
+            character = self._resolve_name(raw, create=True)
+            if character is not None:
+                self._infer_traits(character, narration, match.start(), match.end())
+
+    def _seed_speakers(self, names: list[str]) -> None:
+        """Continue the exchange the previous chunk was in: its last speakers (most recent last)
+        become this chunk's last speakers, so an untagged quote alternates instead of falling to
+        the narrator when the two context paragraphs name nobody."""
+        for name in names:
+            character = self._lookup(name) or self._create(name)
+            self.conv.spoke(character)
 
     def _character_updates(self) -> list[CharacterUpdate]:
         updates: list[CharacterUpdate] = []
@@ -561,7 +659,7 @@ class _ChunkRun:
             updates.append(
                 CharacterUpdate(
                     name=character.name,
-                    aliases=list(character.aliases),
+                    aliases=[a for a in character.aliases if self._alias_is_free(a, character)],
                     gender=character.gender,  # type: ignore[arg-type]
                     age=age,  # type: ignore[arg-type]
                     description=character.description,
@@ -571,26 +669,45 @@ class _ChunkRun:
             )
         return updates
 
+    def _alias_is_free(self, alias: str, character: _Character) -> bool:
+        """False when *alias* already names a different bible entry ('the man' merged into Ansel
+        Vey chapters ago): re-emitting it would fold this character into that entry."""
+        owner = self.bible.find(alias)
+        return owner is None or (character.bible_name is not None and normalize_name(owner.name) == normalize_name(character.bible_name))
+
     # ------------------------------------------------------------------ attribution
     def _vocative(self, quote: str) -> _Character | None:
+        """The character a quote addresses by name. A one-word quote ('Tobias!', 'Hetta,') names
+        a known character, or creates one only when narration outside the quotes also uses the
+        word as a name; bare exclamations ('Riders,', 'Nonsense!') never become characters."""
         text = quote.strip()
         match = VOCATIVE_RE.match(text)
         if match:
             name = match.group("name")
             if name in STOPWORDS or not NAME_TOKEN_RE.fullmatch(name):
                 return None
-            character = self._resolve_name(name, create=True)
+            character = self._resolve_name(name, create=False)
+            if character is None and name in self.narration_tokens:
+                character = self._resolve_name(name, create=True)
             if character is not None:
                 character.mentions += 1
             return character
-        match = ADDRESS_TAIL_RE.search(text) or ADDRESS_HEAD_RE.match(text)
-        if match and match.group("name") not in STOPWORDS:
-            return self._lookup(match.group("name"))
+        for sentence in SENTENCE_SPLIT_RE.split(text):
+            sentence = sentence.strip()
+            match = ADDRESS_TAIL_RE.search(sentence) or ADDRESS_HEAD_RE.match(sentence)
+            if match and match.group("name") not in STOPWORDS:
+                character = self._lookup(match.group("name"))
+                if character is not None:
+                    return character
         return None
 
     def _introduction(self, quote: str) -> tuple[_Character, str] | None:
+        """A quote that names its own speaker: the reply to 'what is your name?' ('Ansel. Ansel
+        Vey.') or a self-introduction inside the quote ('My name is Corwin. Corwin Tallow.'). The
+        longest run becomes the canonical name of the speaker (a provisional descriptor entry when
+        one is in the conversation), shorter runs its aliases."""
         if not NAME_QUESTION_RE.search(self.conv.last_quote):
-            return None
+            return self._self_introduction(quote)
         runs = [" ".join(r.split()) for r in NAME_RUN_SPLIT_RE.split(quote) if r.strip()]
         tokens = [t for r in runs for t in r.split()]
         if not 1 <= len(tokens) <= 4 or not all(NAME_TOKEN_RE.fullmatch(t) and t not in STOPWORDS for t in tokens):
@@ -612,6 +729,30 @@ class _ChunkRun:
                 target.rename(canonical)
         for alias in ordered[1:]:
             target.add_alias(alias)
+        return target, "introduction"
+
+    def _self_introduction(self, quote: str) -> tuple[_Character, str] | None:
+        match = SELF_INTRO_RE.search(quote)
+        if match is None:
+            return None
+        runs = [" ".join(r.split()) for r in (match.group("first"), match.group("second")) if r]
+        runs = [r for r in runs if all(NAME_TOKEN_RE.fullmatch(t) and t not in STOPWORDS for t in r.split())]
+        if not runs:
+            return None
+        ordered = sorted(dict.fromkeys(runs), key=lambda r: (-len(r.split()), runs.index(r)))
+        canonical = ordered[0]
+        target = self._lookup(canonical)
+        if target is None:
+            provisional = [p for p in reversed(self.conv.participants) if p.provisional]
+            if not provisional:
+                return None                    # nobody to name: ordinary attribution and narration harvesting proceed
+            target = provisional[0]
+            target.rename(canonical)
+        elif normalize_name(target.name) != normalize_name(canonical) and (target.provisional or is_token_subset(target.name, canonical)):
+            target.rename(canonical)
+        for alias in ordered[1:]:
+            target.add_alias(alias)
+        target.mentions += 1
         return target, "introduction"
 
     def _explicit_tag(self, text: str) -> _Character | None:
@@ -682,16 +823,16 @@ class _ChunkRun:
                 return character, "subject"
         return None
 
-    def _fallback(self, paragraph: _Paragraph, i: int) -> tuple[_Character | None, str]:
+    def _fallback(self, paragraph: _Paragraph, i: int, addressee: _Character | None) -> tuple[_Character | None, str]:
         span = paragraph.spans[i]
         before = paragraph.spans[i - 1] if i > 0 and paragraph.spans[i - 1].kind == "narration" else None
         last = self.conv.last_speaker
-        partner, candidates = self.conv.partner(last)
+        partner, candidates = self.conv.partner(last, exclude=addressee)
         if partner is not None:
             if before is not None and REPLY_CUE_RE.search(before.text):
                 return partner, "reply"
             if candidates > 1:
-                names = ", ".join(p.name for p in reversed(self.conv.participants) if p is not last)
+                names = ", ".join(p.name for p in reversed(self.conv.participants) if p is not last and p is not addressee)
                 self.warnings.append(f"{span.id}: ambiguous attribution among {candidates} participants ({names}); guessed {partner.name!r}")
             return partner, "alternation"
         if last is not None:
@@ -714,14 +855,14 @@ class _ChunkRun:
             self.reset_paragraphs.add(paragraph.index)
         resolved: dict[int, tuple[_Character | None, str]] = {}
         prev: Span | None = None
+        addressed: _Character | None = None            # whom this paragraph's quotes address (set after attribution)
         for i, span in enumerate(spans):
             if span.kind == "narration":
                 self._scan(span.text, create=True, first_in_paragraph=i == 0, prev_span=prev)
             else:
                 addressee = self._vocative(span.text)
                 if addressee is not None:
-                    self.conv.addressee = addressee
-                    self.conv.mention(addressee)
+                    addressed = addressee
                 hit = self._introduction(span.text) or self._tag_rules(paragraph, i)
                 self.conv.last_quote = span.text
                 if hit is not None:
@@ -735,12 +876,15 @@ class _ChunkRun:
                     nearest = min(resolved, key=lambda j: (abs(j - i), -j))
                     resolved[i] = (resolved[nearest][0], "paragraph")
             else:
-                shared = self._fallback(paragraph, unresolved[0])
+                shared = self._fallback(paragraph, unresolved[0], addressed)
                 for i in unresolved:
                     resolved[i] = shared
             for i in unresolved:
                 if resolved[i][0] is not None:
                     self.conv.spoke(resolved[i][0])  # type: ignore[arg-type]
+        if addressed is not None:
+            self.conv.addressee = addressed              # the addressee is the likely next speaker
+            self.conv.mention(addressed)
         tag_text = paragraph.narration_text
         for i, span in enumerate(spans):
             if span.kind != "quote":
@@ -839,7 +983,7 @@ class HeuristicAnalyzer:
     """Deterministic rule-based analyzer (family ``mock``). Implements ``TextAnalyzer``."""
 
     family: ClassVar[str] = "mock"
-    cache_version: str = "1"
+    cache_version: str = "2"
     model_id: str = "heuristic-1"
 
     def __init__(self, usage: UsageSink | None = None) -> None:

@@ -174,6 +174,8 @@ class Chunk(StrictModel):
     prior_mood: Mood = "none"                 # music mood in force when this chunk begins
     # 1-based paragraph indices (within the chapter) that begin a new scene (Paragraph.scene_break_before)
     scene_break_paragraphs: list[int] = Field(default_factory=list)
+    # the last two distinct dialogue speakers before this chunk in the same chapter, most recent last
+    prior_speakers: list[str] = Field(default_factory=list)
 
     @property
     def text(self) -> str:

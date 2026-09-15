@@ -41,12 +41,13 @@ def test_run_missing_file_is_an_input_error(tmp_path: Path, capsys: pytest.Captu
     assert not (tmp_path / "bookreader.db").exists()
 
 
-def test_run_unsupported_file_fails_with_input_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_unsupported_file_is_a_usage_error_before_any_job_exists(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     bad = tmp_path / "book.csv"
     bad.write_text("a,b\n" * 100, encoding="utf-8")
     code = cli.main(["run", str(bad), "--out", str(tmp_path / "out")])
     err = capsys.readouterr().err
-    assert code == 1 and "input" in err and "unsupported file type" in err
+    assert code == 2 and "InputError" in err and "unsupported file type" in err and ".csv" in err
+    assert not (tmp_path / "out").exists()                                    # no job row, no copied source
 
 
 def test_run_with_cast_override_and_from_stage(tmp_path: Path, sample_book_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -64,8 +65,41 @@ def test_run_with_cast_override_and_from_stage(tmp_path: Path, sample_book_path:
     assert "re-running from stage finalize" in out and str(job_dir / "manifest.json") in out
     assert len(list((tmp_path / "out" / "jobs").glob("*"))) == 1                 # reused, not a new job
 
+    script = job_dir / "scripts" / "ch02.json"
+    tampered = json.loads(script.read_text(encoding="utf-8"))
+    tampered["__marker__"] = True
+    script.write_text(json.dumps(tampered), encoding="utf-8")
+    assert cli.main(["run", str(sample_book_path), "--out", str(tmp_path / "out"), "--from-stage", "analyze"]) == 0
+    out = capsys.readouterr().out
+    assert "re-running from stage analyze" in out and "scripts present" not in out
+    assert "__marker__" not in json.loads(script.read_text(encoding="utf-8"))   # really re-analyzed (from the cache)
+    assert len(list((tmp_path / "out" / "jobs").glob("*"))) == 1
+
     assert cli.main(["run", str(sample_book_path), "--out", str(tmp_path / "fresh"), "--from-stage", "render"]) == 2
     assert "no previous job" in capsys.readouterr().err
+
+
+def test_from_stage_applies_cast_and_rejects_baked_in_flags(tmp_path: Path, sample_book_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out = tmp_path / "out"
+    assert cli.main(["run", str(sample_book_path), "--out", str(out), "--chapters", "1", "--no-music", "--no-sfx"]) == 0
+    job_dir = next((out / "jobs").glob("*"))
+    capsys.readouterr()
+    for flags in (["--chapters", "2"], ["--no-music"], ["--no-sfx"], ["--title", "Other"]):
+        assert cli.main(["run", str(sample_book_path), "--out", str(out), "--from-stage", "cast", *flags]) == 2
+        assert "cannot be combined with --from-stage" in capsys.readouterr().err
+    overrides = tmp_path / "cast.json"
+    overrides.write_text(json.dumps({"Tobias": "mock-m-teen"}), encoding="utf-8")
+    assert cli.main(["run", str(sample_book_path), "--out", str(out), "--from-stage", "finalize", "--cast", str(overrides)]) == 2
+    assert "--cast needs --from-stage cast" in capsys.readouterr().err
+    assert not (job_dir / "cast_overrides.json").exists()
+
+    assert cli.main(["run", str(sample_book_path), "--out", str(out), "--from-stage", "cast", "--cast", str(overrides)]) == 0
+    capsys.readouterr()
+    assert json.loads((job_dir / "cast_overrides.json").read_text(encoding="utf-8")) == {"Tobias": "mock-m-teen"}
+    cast = json.loads((job_dir / "cast.json").read_text(encoding="utf-8"))
+    tobias = next(a for a in cast["characters"] if a["character"] == "Tobias")
+    assert tobias["voice"]["id"] == "mock-m-teen" and tobias["source"] == "override"
+    assert len(list((out / "jobs").glob("*"))) == 1
 
 
 def test_run_rejects_bad_provider_config(tmp_path: Path, sample_book_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -85,11 +119,17 @@ def test_estimate_prints_counts(sample_book_path: Path, capsys: pytest.CaptureFi
 
 
 def test_estimate_chapter_subset_and_missing_file(tmp_path: Path, sample_book_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["estimate", str(sample_book_path)]) == 0
+    full = {line.split()[0]: int(line.split()[-1]) for line in capsys.readouterr().out.splitlines() if line.startswith(("words", "chapters"))}
     assert cli.main(["estimate", str(sample_book_path), "--chapters", "2-3"]) == 0
     out = capsys.readouterr().out
     assert any(line.startswith("chapters") and line.split()[-1] == "2" for line in out.splitlines())
+    words = next(int(line.split()[-1]) for line in out.splitlines() if line.startswith("words"))
+    assert 0 < words < full["words"] == 618                                   # counts follow the chapter subset
     assert cli.main(["estimate", str(tmp_path / "nope.txt")]) == 2
     assert "InputError" in capsys.readouterr().err
+    assert cli.main(["estimate", str(sample_book_path), "--chapters", "0"]) == 2   # a usage error, not a traceback
+    assert "invalid chapter range" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- providers
@@ -127,8 +167,10 @@ def test_parse_chapters() -> None:
     assert cli.parse_chapters(None) is None and cli.parse_chapters(" ") is None
     assert cli.parse_chapters("1-3,5") == [1, 2, 3, 5]
     assert cli.parse_chapters("2") == [2]
-    with pytest.raises(Exception):
-        cli.parse_chapters("3-1")
+    assert cli.parse_chapters("2,1-2, 2") == [1, 2]
+    for bad in ("3-1", "2-", "1-", "0", "-1", "a", "1-2000000000"):          # open-ended, reversed and huge ranges
+        with pytest.raises(Exception, match="chapter range"):
+            cli.parse_chapters(bad)
 
 
 def test_bad_env_value_is_a_config_error(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

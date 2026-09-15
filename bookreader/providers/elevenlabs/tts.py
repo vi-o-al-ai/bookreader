@@ -9,6 +9,7 @@ from bookreader.providers.base import NullUsage, UsageSink
 from bookreader.providers.elevenlabs.client import (
     FAMILY,
     INSTALL_HINT,
+    NO_SDK_RETRIES,
     OUTPUT_FORMAT,
     api_key_from,
     check_sdk,
@@ -102,7 +103,7 @@ class ElevenLabsTTS:
         try:
             raw = self._search_pages()
         except AttributeError:
-            raw = list(guarded_call(lambda: self.client.voices.get_all().voices, self.concurrency))
+            raw = list(guarded_call(lambda: self.client.voices.get_all(request_options=NO_SDK_RETRIES).voices, self.concurrency))
         voices = [voice_info(v) for v in raw[: self.max_voices]]
         log.debug("elevenlabs catalog: %d voices", len(voices))
         return voices
@@ -112,7 +113,7 @@ class ElevenLabsTTS:
         out: list[Any] = []
         token: str | None = None
         while True:
-            page = guarded_call(lambda: search(page_size=PAGE_SIZE, next_page_token=token), self.concurrency)
+            page = guarded_call(lambda: search(page_size=PAGE_SIZE, next_page_token=token, request_options=NO_SDK_RETRIES), self.concurrency)
             out.extend(page.voices or [])
             token = getattr(page, "next_page_token", None)
             if not getattr(page, "has_more", False) or not token or len(out) >= self.max_voices:
@@ -141,6 +142,7 @@ class ElevenLabsTTS:
                     previous_text=req.previous_text,
                     next_text=req.next_text,
                     seed=req.seed,
+                    request_options=NO_SDK_RETRIES,
                 )
             ),
             self.concurrency,

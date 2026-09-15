@@ -11,7 +11,7 @@ from typing import Callable, ClassVar
 
 import pytest
 
-from bookreader.jobs.db import JobStore
+from bookreader.jobs.db import JobStore, now_iso
 from bookreader.jobs.paths import JobPaths, read_json
 from bookreader.pipeline.cache import ClipCache
 from bookreader.pipeline.run import create_job, run_job
@@ -29,10 +29,12 @@ from bookreader.types import (
     ChapterTts,
     Job,
     JobStatus,
+    ProviderPermanentError,
     ProviderTransientError,
     Stage,
     StageState,
     TTSRequest,
+    VoiceInfo,
 )
 from bookreader.usage import UsageRouter
 
@@ -320,3 +322,219 @@ def test_finalize_prunes_cache_to_tiny_cap(tmp_path: Path, sample_book_path: Pat
     assert 0 < cache.size() <= 1024 * 1024
     assert env.paths(job).manifest.is_file()
     assert any("pruned" in e.message for e in env.store.events_after(job.id, 0, 1000))
+
+
+# --------------------------------------------------------------------------- explicit re-runs (retry from a stage)
+def _events(env: Env, job: Job) -> list[str]:
+    return [e.message for e in env.store.events_after(job.id, 0, 10000)]
+
+
+def test_retry_from_analyze_regenerates_scripts_and_cast(fresh: Env) -> None:
+    """requeue(from_stage=analyze) must re-run analyze and cast even though their outputs exist."""
+    job = fresh.run(fresh.new_job(), spied())
+    assert job.status == JobStatus.done, job.error
+    paths = fresh.paths(job)
+    bible_before = paths.bible.read_bytes()
+    os.utime(paths.bible, (1_000_000, 1_000_000))
+    os.utime(paths.cast, (1_000_000, 1_000_000))
+    first_events = len(_events(fresh, job))
+
+    fresh.store.requeue(job.id, from_stage=Stage.analyze)
+    paths.manifest.unlink()
+    spy = spied()
+    spy.analysis.inner.family = "anthropic"            # a provider switch: same text, different analysis cache keys
+    spy.analysis.inner.cache_version = "99"
+    retried = fresh.run(job, spy)
+    assert retried.status == JobStatus.done, retried.error
+    assert spy.counts["analysis"] == 3                 # really re-analyzed (cache keys differ for the new family)
+    assert spy.counts["tts"] == 0                      # ... while unchanged voices/lines stay cache hits
+    assert paths.bible.stat().st_mtime > 1_000_000 and paths.cast.stat().st_mtime > 1_000_000
+    assert paths.bible.read_bytes() == bible_before    # the heuristic result is deterministic
+    new_events = _events(fresh, job)[first_events:]
+    assert not any("skipped" in m and ("analyze" in m or "cast" in m) for m in new_events), new_events
+    records = {r.stage: r for r in fresh.store.stage_records(job.id)}
+    assert records[Stage.ingest].attempts == 1
+    assert all(records[s].attempts == 2 for s in (Stage.analyze, Stage.cast, Stage.render, Stage.finalize))
+
+
+def test_retry_from_analyze_with_same_provider_is_free(warm: tuple[Env, Job, Spied]) -> None:
+    env, _, _ = warm
+    job = env.run(env.new_job(), spied())
+    paths = env.paths(job)
+    os.utime(paths.script(1), (1_000_000, 1_000_000))
+    env.store.requeue(job.id, from_stage=Stage.analyze)
+    spy = spied()
+    retried = env.run(job, spy)
+    assert retried.status == JobStatus.done, retried.error
+    assert spy.counts == {"analysis": 0, "tts": 0, "music": 0, "sfx": 0}
+    assert paths.script(1).stat().st_mtime > 1_000_000  # rewritten from cached chunk analyses
+    assert env.store.usage_summary(job.id).by_capability["analysis"]["calls"] >= 3.0
+
+
+def test_retry_from_ingest_rewrites_book(fresh: Env) -> None:
+    job = fresh.run(fresh.new_job(), spied())
+    assert job.status == JobStatus.done, job.error
+    paths = fresh.paths(job)
+    os.utime(paths.book, (1_000_000, 1_000_000))
+    fresh.store.requeue(job.id, from_stage=Stage.ingest)
+    retried = fresh.run(job, spied())
+    assert retried.status == JobStatus.done, retried.error
+    assert paths.book.stat().st_mtime > 1_000_000
+    assert not any("ingest: book.json exists" in m for m in _events(fresh, job))
+
+
+# --------------------------------------------------------------------------- tts provider family switch
+class _OtherTTS:
+    """A second TTS family with its own catalog that rejects voice ids it never advertised."""
+
+    family = "other"
+    cache_version = "1"
+    max_chars = 5000
+
+    def __init__(self) -> None:
+        self.inner = MockTTS(ms_per_char=MS_PER_CHAR)
+        self.voice_ids: list[str] = []
+
+    def list_voices(self) -> list[VoiceInfo]:
+        voices = [v.model_copy(update={"id": "other-" + v.id, "family": "other"}) for v in self.inner.list_voices()]
+        return voices
+
+    def synthesize(self, req: TTSRequest) -> AudioClip:
+        if not req.voice_id.startswith("other-"):
+            raise ProviderPermanentError(f"unknown voice id {req.voice_id!r}")
+        self.voice_ids.append(req.voice_id)
+        return self.inner.synthesize(req.model_copy(update={"voice_id": req.voice_id[len("other-"):]}))
+
+
+@pytest.mark.parametrize("from_stage", [None, Stage.cast, Stage.render])
+def test_switching_tts_family_recasts_instead_of_sending_stale_voice_ids(fresh: Env, from_stage: Stage | None) -> None:
+    if from_stage is None:                                  # plain retry of a job that failed mid-render
+        job = fresh.run(fresh.new_job(), spied(tts_fail_from=5))
+        assert job.status == JobStatus.failed
+    else:
+        job = fresh.run(fresh.new_job(), spied())
+        assert job.status == JobStatus.done, job.error
+    paths = fresh.paths(job)
+    assert Cast.model_validate(read_json(paths.cast)).family == "mock"
+
+    other = _OtherTTS()
+    spy = spied()
+    providers = Providers(analysis=spy.analysis, tts=other, music=spy.music, sfx=spy.sfx)  # type: ignore[arg-type]
+    fresh.store.requeue(job.id, from_stage=from_stage)
+    paths.manifest.unlink(missing_ok=True)
+    retried = run_job(job.id, fresh.settings, fresh.store, providers=providers)
+    assert retried.status == JobStatus.done, retried.error
+    cast = Cast.model_validate(read_json(paths.cast))
+    assert cast.family == "other" and cast.narrator.voice.id.startswith("other-")
+    assert other.voice_ids and all(v.startswith("other-") for v in other.voice_ids)
+    assert any("re-casting" in m and "family 'mock'" in m for m in _events(fresh, job))
+    voices = read_json(paths.voices)
+    assert all(v["family"] == "other" for v in voices)                  # PUT /cast validates against the new catalog
+
+
+def test_unchanged_family_retry_keeps_the_cast(fresh: Env) -> None:
+    job = fresh.run(fresh.new_job(), spied())
+    assert job.status == JobStatus.done, job.error
+    paths = fresh.paths(job)
+    os.utime(paths.cast, (1_000_000, 1_000_000))
+    fresh.store.requeue(job.id, from_stage=Stage.render)
+    retried = fresh.run(job, spied())
+    assert retried.status == JobStatus.done, retried.error
+    assert paths.cast.stat().st_mtime == 1_000_000                          # not re-cast
+    assert not any("re-casting" in m for m in _events(fresh, job))
+
+
+# --------------------------------------------------------------------------- concurrent cache writers
+def test_concurrent_writers_of_one_cache_key_never_corrupt_it(tmp_path: Path) -> None:
+    cache = ClipCache(tmp_path / "cache")
+    clip = AudioClip.silence(2000, SAMPLE_RATE)
+    errors: list[BaseException] = []
+    short_reads: list[int] = []
+
+    def write() -> None:
+        for _ in range(60):
+            try:
+                cache.put("tts", "samekey", clip)
+                cache.put_json("analysis", "samekey", {"n": 1})
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    def read() -> None:
+        for _ in range(120):
+            got = cache.get("tts", "samekey")
+            if got is not None and len(got.samples) != len(clip.samples):
+                short_reads.append(len(got.samples))
+            doc = cache.get_json("analysis", "samekey")
+            if doc is not None and doc != {"n": 1}:
+                short_reads.append(-1)
+
+    threads = [threading.Thread(target=write) for _ in range(4)] + [threading.Thread(target=read) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and short_reads == []
+    final = cache.get("tts", "samekey")
+    assert final is not None and len(final.samples) == len(clip.samples)
+    assert cache.get_json("analysis", "samekey") == {"n": 1}
+    assert not [p for p in (cache.root / "tts").iterdir() if p.name.startswith(".")]   # no temp files left behind
+
+
+# --------------------------------------------------------------------------- prune vs a resumed job
+def test_prune_spares_entries_used_since_the_floor(tmp_path: Path) -> None:
+    cache = ClipCache(tmp_path / "cache")
+    clip = AudioClip.silence(100, SAMPLE_RATE)
+    now = time.time()
+    for index in range(4):
+        path = cache.put("tts", f"k{index}", clip)
+        os.utime(path, (now - 1000 + index * 10, now - 1000 + index * 10))
+    per_file = cache.path("tts", "k0").stat().st_size
+    assert cache.has("tts", "k1")                                            # a hit counts as a use ...
+    assert cache.path("tts", "k1").stat().st_mtime > now - 1                 # ... and bumps the mtime
+    removed = cache.prune(per_file, keep_newer_than=now - 985)
+    assert [p.name for p in removed] == ["k0.wav"]                           # k2/k3 protected by the floor, k1 by its use
+    assert cache.size() == 3 * per_file
+
+
+def test_evicted_clip_is_regenerated_at_mix(fresh: Env) -> None:
+    """Another job's finalize prunes the tts clips of a resumed chapter between its tts and mix substages."""
+    failing = spied(tts_fail_from=200)
+    job = fresh.new_job()
+    paths = fresh.paths(job)
+    cache = ClipCache(paths.cache_root)
+    evicted: list[str] = []
+    lock = threading.Lock()
+
+    class PruningSfx(CountingSfx):
+        def generate(self, req: object) -> object:
+            with lock:
+                if not evicted:                                              # stand-in for a concurrent finalize
+                    for path in list((cache.root / "tts").glob("*.wav")):
+                        evicted.append(path.stem)
+                        path.unlink()
+            return super().generate(req)
+
+    sfx = PruningSfx(ProceduralSfx())
+    spy = Spied(Providers(analysis=failing.analysis, tts=failing.tts, music=failing.music, sfx=sfx), failing.analysis, failing.tts, failing.music, sfx)  # type: ignore[arg-type]
+    done = fresh.run(job, spy)
+    assert done.status == JobStatus.done, done.error
+    assert evicted and all(cache.has("tts", key) for key in evicted)          # regenerated, back in the cache
+    assert any("evicted from the cache; regenerating" in m for m in _events(fresh, job))
+    assert spy.counts["tts"] == fresh.total_tts(done) + len(evicted)
+
+
+def test_finalize_prune_spares_a_concurrently_running_job(tmp_path: Path, sample_book_path: Path) -> None:
+    env = make_env(tmp_path, sample_book_path, cache_max_mb=1)
+    other = env.new_job()                                                    # pretend it is mid-render on another worker
+    env.store.set_status(other.id, JobStatus.running)
+    env.store.update_job(other.id, started_at=now_iso())
+    job = env.run(env.new_job(), spied())
+    assert job.status == JobStatus.done, job.error
+    cache = ClipCache(env.paths(job).cache_root)
+    assert cache.size() > 1024 * 1024                                        # cap exceeded rather than evicting in-use clips
+    assert not any("pruned" in e.message for e in env.store.events_after(job.id, 0, 1000))
+
+    env.store.set_status(other.id, JobStatus.done)
+    env.store.requeue(job.id, from_stage=Stage.finalize)
+    assert env.run(job, spied()).status == JobStatus.done
+    assert cache.size() <= 1024 * 1024

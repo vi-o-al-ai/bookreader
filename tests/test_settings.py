@@ -51,6 +51,7 @@ def test_env_parsing_types_and_secrets():
         ("BOOKREADER_PRICES", "[1,2]"),
         ("BOOKREADER_CONCURRENCY", "0"),
         ("BOOKREADER_ELEVENLABS_SFX_PROMPT_INFLUENCE", "1.5"),
+        ("BOOKREADER_LOG_LEVEL", "WARN"),                  # uvicorn only knows critical/error/warning/info/debug
     ],
 )
 def test_invalid_values_name_the_variable(var, value):
@@ -79,3 +80,8 @@ def test_with_snapshot_keeps_current_providers_but_job_knobs():
     assert merged.music_gain_db == -20.0
     assert merged.tts_provider == "mock"
     assert merged.secrets == {"X_API_KEY": "1"}
+
+
+@pytest.mark.parametrize("value", ["debug", "INFO", "Warning", "ERROR", "critical"])
+def test_log_level_accepts_the_shared_names_case_insensitively(value):
+    assert Settings.from_env({"BOOKREADER_LOG_LEVEL": value}).log_level == value

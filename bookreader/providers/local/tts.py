@@ -32,7 +32,10 @@ PIPER_DOWNLOAD_HINT = (
     "download voices from https://huggingface.co/rhasspy/piper-voices (each voice is a .onnx file "
     "plus its .onnx.json config) into BOOKREADER_PIPER_VOICES_DIR"
 )
-ESPEAK_ERROR = "kokoro needs the espeak-ng system package (apt-get install espeak-ng)"
+ESPEAK_WARNING = (
+    "espeak-ng was not found on PATH; kokoro bundles libespeak-ng through espeakng-loader, but if "
+    "out-of-dictionary words are skipped, apt-get install espeak-ng"
+)
 SIDECAR_NAME = "voices.json"
 SPEAKER_SEP = "#"
 KOKORO_RATE = 24000
@@ -49,6 +52,25 @@ KOKORO_VOICES: tuple[str, ...] = (
     "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
 )
 KOKORO_LANG_NAMES: dict[str, str] = {"a": "american", "b": "british"}
+# KPipeline(lang_code=...) lower-cases, applies these aliases and then asserts membership in
+# KOKORO_LANG_CODES (kokoro 0.9.4 pipeline.py); validated in check() so a typo is a config error.
+KOKORO_LANG_ALIASES: dict[str, str] = {
+    "en-us": "a", "en-gb": "b", "es": "e", "fr-fr": "f", "hi": "h", "it": "i", "pt-br": "p", "ja": "j", "zh": "z",
+}
+KOKORO_LANG_CODES: tuple[str, ...] = ("a", "b", "e", "f", "h", "i", "p", "j", "z")
+
+
+def normalize_kokoro_lang(raw: str) -> str:
+    """The one-letter Kokoro language code for ``BOOKREADER_KOKORO_LANG`` (aliases accepted).
+    Raises ProviderConfigError naming the variable and the valid codes."""
+    code = str(raw).strip().lower()
+    code = KOKORO_LANG_ALIASES.get(code, code)
+    if code not in KOKORO_LANG_CODES:
+        raise ProviderConfigError(
+            f"BOOKREADER_KOKORO_LANG must be one of {', '.join(KOKORO_LANG_CODES)} "
+            f"(or an alias: {', '.join(KOKORO_LANG_ALIASES)}), got {raw!r}"
+        )
+    return code
 
 
 def _length_scale(speed: float) -> float:
@@ -301,23 +323,31 @@ class KokoroTTS:
     max_chars: int = 2000
 
     def __init__(self, pipeline_factory: Callable[[str], Any] | None = None, lang: str = "a", usage: UsageSink | None = None) -> None:
-        self.lang = lang
+        self.lang = normalize_kokoro_lang(lang)
         self.pipeline_factory: Callable[[str], Any] = pipeline_factory or _default_kokoro_factory
         self.usage: UsageSink = usage or NullUsage()
-        self.cache_version: str = f"kokoro:{lang}"
+        self.cache_version: str = f"kokoro:{self.lang}"
         self._pipeline: Any = None
         self._lock = threading.Lock()
+        # KPipeline's English G2P falls back to phonemizer's espeak backend on one process-wide
+        # libespeak-ng handle, which is not reentrant (piper guards the same library with a lock),
+        # so synthesis is serialized like the other local models.
+        self._synth_lock = threading.Lock()
 
     @classmethod
     def check(cls, settings: "Settings") -> list[str]:
-        """``import kokoro`` must work and ``espeak-ng`` must be on PATH."""
+        """``import kokoro`` must work and ``BOOKREADER_KOKORO_LANG`` must be a KPipeline code.
+
+        A missing ``espeak-ng`` binary is only a warning: kokoro's misaki[en] loads libespeak-ng
+        through ``espeakng-loader`` and never shells out, and KPipeline merely disables its
+        espeak fallback when that fails.
+        """
         try:
             import kokoro  # noqa: F401 - presence check only
         except ImportError as exc:
             raise ProviderConfigError(f"kokoro is not installed; {KOKORO_HINT}") from exc
-        if shutil.which("espeak-ng") is None:
-            raise ProviderConfigError(ESPEAK_ERROR)
-        return []
+        normalize_kokoro_lang(settings.kokoro_lang)
+        return [ESPEAK_WARNING] if shutil.which("espeak-ng") is None else []
 
     @classmethod
     def from_settings(cls, settings: "Settings", usage: UsageSink | None = None) -> "KokoroTTS":
@@ -340,17 +370,18 @@ class KokoroTTS:
         return [kokoro_voice_info(v) for v in KOKORO_VOICES]
 
     def synthesize(self, req: TTSRequest) -> AudioClip:
-        """Concatenate every result's float32 audio at 24 kHz."""
+        """Concatenate every result's float32 audio at 24 kHz (one synthesis at a time)."""
         if len(req.text) > self.max_chars:
             raise ProviderPermanentError(f"kokoro accepts at most {self.max_chars} characters, got {len(req.text)}")
         pipeline = self._get_pipeline()
         pieces: list[np.ndarray] = []
-        for result in pipeline(req.text, voice=req.voice_id, speed=req.settings.speed):
-            audio = getattr(result, "audio", None)
-            if audio is None and isinstance(result, tuple):
-                audio = result[-1]
-            if audio is not None:
-                pieces.append(_as_numpy(audio))
+        with self._synth_lock:
+            for result in pipeline(req.text, voice=req.voice_id, speed=req.settings.speed):
+                audio = getattr(result, "audio", None)
+                if audio is None and isinstance(result, tuple):
+                    audio = result[-1]
+                if audio is not None:
+                    pieces.append(_as_numpy(audio))
         samples = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
         clip = AudioClip(samples, KOKORO_RATE)
         self.usage.record("tts", self.family, "characters", float(len(req.text)), meta={"voice_id": req.voice_id, "engine": "kokoro"})

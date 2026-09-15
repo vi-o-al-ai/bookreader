@@ -141,6 +141,57 @@ def test_heading_heuristics() -> None:
     assert heading_title("A B C D E F G H I") is None           # nine words
 
 
+def test_keyword_initial_sentences_are_not_headings() -> None:
+    for sentence in (
+        "Part of her wanted to run.", "Book me a room at the inn, she thought.", "Interlude music drifted up from below.",
+        "Chapter and verse, he quoted.", "Part civil war", "I SAID NO.", "'KEEP OUT'", "TO WHOM IT MAY CONCERN,",
+    ):
+        assert heading_title(sentence) is None, sentence
+    for heading in (
+        "Part One", "PART TWO", "Book II: The Return", "Chapter 1: The Storm Bell", "Prologue", "Epilogue - Ten Years Later",
+        "Chapter 3.", "Chapter Twenty-One", "Chapter 12 The Storm", "Interlude: Winter", "THE STORM BELL", "KEEP OUT BY ORDER",
+    ):
+        assert heading_title(heading) == heading, heading
+
+
+def test_keyword_initial_sentence_inside_a_chapter_does_not_split_it() -> None:
+    body = paragraphs_of(200)
+    sentence = "Part of her wanted to run."
+    title, chapters = detect_chapters(["The Roof", "Chapter 1", *body[:2], sentence, *body[2:], "Chapter 2", *body])
+    assert title == "The Roof"
+    assert [t for t, _ in chapters] == ["Chapter 1", "Chapter 2"]
+    assert chapters[0][1] == [*body[:2], sentence, *body[2:]], "the sentence is spoken, not turned into a title"
+
+
+def test_pre_heading_prose_is_kept_not_dropped() -> None:
+    body = paragraphs_of(200)
+    opening = prose(50, seed=9)
+    title, chapters = detect_chapters(["The Roof", opening, "Chapter 1", *body, "Chapter 2", *body])
+    assert title == "The Roof"
+    assert [t for t, _ in chapters] == ["Chapter 1", "Chapter 2"], "a short prologue merges into the first chapter"
+    assert chapters[0][1] == [opening, *body]
+    # a book with no real headings and two keyword-initial sentences keeps every paragraph
+    title, chapters = detect_chapters(["The Roof", opening, "Part of her wanted to run.", prose(60, seed=3), "Book me a room, she thought.", prose(80, seed=4)])
+    assert title is None and [t for t, _ in chapters] == ["Part 1"]
+    assert len(chapters[0][1]) == 6
+
+
+def test_all_caps_lines_inside_a_keyworded_book_stay_spoken() -> None:
+    body = paragraphs_of(200)
+    signs = ["KEEP OUT BY ORDER", "THIS MEANS YOU"]
+    title, chapters = detect_chapters(["The Gate", "Chapter 1", *body[:1], *signs, *body[1:], "Chapter 2", *body, "THE END"])
+    assert [t for t, _ in chapters] == ["Chapter 1", "Chapter 2"]
+    assert chapters[0][1] == [*body[:1], *signs, *body[1:]], "the sign lines are paragraphs, not chapter titles"
+    assert "THE END" not in chapters[1][1], "a trailing caps line is still a trailer"
+    # a caps subtitle right after a keyworded heading is still a heading (an empty chapter that merges away)
+    title, chapters = detect_chapters(["The Gate", "Chapter 1", "THE STORM BELL", *body, "Chapter 2", *body])
+    assert [t for t, _ in chapters] == ["THE STORM BELL", "Chapter 2"]
+    assert "THE STORM BELL" not in chapters[0][1]
+    # books whose only headings are caps lines keep working
+    title, chapters = detect_chapters(["THE WATCH", "THE FIRST NIGHT", *body, "THE SECOND NIGHT", *body])
+    assert title == "THE WATCH" and [t for t, _ in chapters] == ["THE FIRST NIGHT", "THE SECOND NIGHT"]
+
+
 def test_headingless_text_gets_synthetic_parts(tmp_path: Path) -> None:
     paras = paragraphs_of(15_000, per_paragraph=75)
     path = tmp_path / "long.txt"

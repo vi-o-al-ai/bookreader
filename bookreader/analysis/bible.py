@@ -25,6 +25,27 @@ def is_descriptor(name: str) -> bool:
     return bool(DESCRIPTOR_RE.match(name.strip()))
 
 
+# descriptor -> (gender, age) for the specific ones a label may use instead of a name; 'the man' /
+# 'the stranger' are too generic to resolve here and stay provisional entries
+DESCRIPTOR_TRAITS: dict[str, tuple[str, str]] = {
+    "the boy": ("male", "child"),
+    "the girl": ("female", "child"),
+    "the old man": ("male", "elderly"),
+    "the old woman": ("female", "elderly"),
+}
+
+
+def resolve_descriptor(bible: CastBible, name: str) -> CharacterEntry | None:
+    """The unique non-provisional entry a specific descriptor label such as ``"the boy"`` denotes
+    (the bible's only male child), the way the heuristic analyzer reads it; ``None`` otherwise."""
+    traits = DESCRIPTOR_TRAITS.get(" ".join(name.lower().split()))
+    if traits is None:
+        return None
+    gender, age = traits
+    hits = [entry for entry in bible.characters if not entry.provisional and entry.age == age and _agrees(entry.gender, gender)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def strip_honorific(name: str) -> tuple[str, str | None]:
     """``"Old Hetta"`` -> ``("Hetta", "Old Hetta")``; a name without honorific -> ``(name, None)``."""
     cleaned = " ".join(name.split())
@@ -112,27 +133,40 @@ def _provisional_match(bible: CastBible, update: CharacterUpdate) -> CharacterEn
     return None
 
 
-def _subset_match(bible: CastBible, name: str) -> CharacterEntry | None:
-    """The unique non-provisional entry whose single-token name is a token of the multi-token
-    *name*, or whose multi-token name contains the single-token *name*."""
-    hosts = [
+def _subset_match(bible: CastBible, update: CharacterUpdate) -> CharacterEntry | None:
+    """The unique non-provisional entry whose single-token name is a token of the update's
+    multi-token name, or whose multi-token name contains the update's single-token name, and whose
+    gender/age do not contradict the update ('Ash' the female child is not 'Ash Carver' the man)."""
+    name = update.name
+    related = [
         entry for entry in bible.characters
         if not entry.provisional and (is_token_subset(entry.name, name) or is_token_subset(name, entry.name))
     ]
+    hosts = [entry for entry in related if _traits_agree(entry, update)]
+    for entry in related:
+        if entry not in hosts:
+            log.warning("not merging %r into %r: %s/%s contradicts %s/%s", name, entry.name, update.gender, update.age, entry.gender, entry.age)
     return hosts[0] if len(hosts) == 1 else None
 
 
 def _find_target(bible: CastBible, update: CharacterUpdate) -> CharacterEntry | None:
-    """Entry the update describes: by name, by one of its aliases, by unique token subset, or a
-    provisional entry whose descriptor it mentions."""
+    """Entry the update describes: by name, by one of its aliases (when gender/age do not
+    contradict it), by unique token subset, or a provisional entry whose descriptor it mentions."""
     target = bible.find(update.name)
     for alias in update.aliases:
         if target is not None:
             break
         candidate = bible.find(alias)
-        if candidate is not None and (not candidate.provisional or _traits_agree(candidate, update)):
+        if candidate is None:
+            continue
+        if _traits_agree(candidate, update):
             target = candidate
-    return target or _subset_match(bible, update.name) or _provisional_match(bible, update)
+        else:
+            log.warning(
+                "alias %r of %r names %r, whose %s/%s contradicts %s/%s; not merging",
+                alias, update.name, candidate.name, candidate.gender, candidate.age, update.gender, update.age,
+            )
+    return target or _subset_match(bible, update) or _provisional_match(bible, update)
 
 
 def _merge_update(entry: CharacterEntry, update: CharacterUpdate) -> None:
@@ -205,12 +239,13 @@ def apply_updates(bible: CastBible, updates: list[CharacterUpdate], chapter_inde
 
 def register_speaker(bible: CastBible, name: str, chapter_index: int) -> tuple[CastBible, str]:
     """Count one dialogue line for *name*, creating an entry when the analyzer named someone the
-    bible does not know (provisional when the name is a descriptor). Returns the canonical name.
+    bible does not know (provisional when the name is a descriptor; a specific descriptor such as
+    'the boy' first resolves to the bible's only male child). Returns the canonical name.
     """
     if not name.strip() or normalize_name(name) == NARRATOR.lower():
         return bible, NARRATOR
     out = bible.model_copy(deep=True)
-    entry = out.find(name)
+    entry = out.find(name) or resolve_descriptor(out, name)
     if entry is None:
         canonical, honorific_form = strip_honorific(name)
         provisional = is_descriptor(canonical)
