@@ -5,13 +5,19 @@ in :mod:`bookreader.types`, and it ends with the prompt version. It is sent with
 ``cache_control: ephemeral`` so every chunk of every job hits the same cached prefix.
 :func:`build_user_message` renders one chunk (bible, mood in force, read-only context, the spans
 to label) and, on the repair pass, the note describing what was wrong with the previous reply.
+The first span of every paragraph listed in ``Chunk.scene_break_paragraphs`` carries a
+``"scene_break": true`` key so the model knows where a new scene starts.
 """
 from __future__ import annotations
 
 import json
+import re
 
 from bookreader.analysis.schema import PROMPT_VERSION
 from bookreader.types import AGES, DELIVERIES, EMOTIONS, GENDERS, MOODS, NARRATOR, CastBible, Chunk
+
+
+_SPAN_PARAGRAPH_RE = re.compile(r"^c\d+p(\d+)s\d+$")   # span id -> its 1-based paragraph index
 
 
 def _vocabulary(values: tuple[str, ...]) -> str:
@@ -21,7 +27,7 @@ def _vocabulary(values: tuple[str, ...]) -> str:
 SYSTEM_PROMPT: str = f"""You are an audio-drama script editor. You label a novel, one chunk at a time, so it can be performed by multiple voices with music and sound effects.
 
 ## Input
-The user message carries the cast bible so far (JSON), the music mood currently playing, a few previous paragraphs for context only (already processed; never label them), and a numbered list of spans to label. Each span has an id, a kind ("narration" or "quote") and its verbatim text. Do NOT rewrite, correct or quote back any span text; refer to spans only by id.
+The user message carries the cast bible so far (JSON), the music mood currently playing, a few previous paragraphs for context only (already processed; never label them), and a numbered list of spans to label. Each span has an id, a kind ("narration" or "quote") and its verbatim text. A span carrying "scene_break": true is the first span of a paragraph that opens a new scene: the conversation starts afresh there, so the participants and turn order of earlier paragraphs do not carry across it, and the music mood may change. Do NOT rewrite, correct or quote back any span text; refer to spans only by id.
 
 ## Labels
 Output exactly one label per QUOTE span. Narration spans may be omitted: they are always spoken by {NARRATOR}. Attribute each quote in this order of evidence:
@@ -53,8 +59,23 @@ prompt-version: {PROMPT_VERSION}"""
 
 
 def build_user_message(chunk: Chunk, bible: CastBible, repair_note: str | None = None) -> str:
-    """The user turn for *chunk*: bible, mood in force, context, spans, and an optional repair note."""
-    spans = [{"id": span.id, "kind": span.kind, "text": span.text} for span in chunk.spans]
+    """The user turn for *chunk*: bible, mood in force, context, spans, and an optional repair note.
+
+    The first span of each paragraph in ``chunk.scene_break_paragraphs`` gets ``"scene_break": true``;
+    every other span is rendered as just ``id``, ``kind`` and ``text``.
+    """
+    scene_breaks = set(chunk.scene_break_paragraphs)
+    marked: set[int] = set()
+    spans: list[dict[str, object]] = []
+    for span in chunk.spans:
+        entry: dict[str, object] = {"id": span.id, "kind": span.kind}
+        match = _SPAN_PARAGRAPH_RE.match(span.id)
+        paragraph = int(match.group(1)) if match else None
+        if paragraph is not None and paragraph in scene_breaks and paragraph not in marked:
+            entry["scene_break"] = True
+            marked.add(paragraph)
+        entry["text"] = span.text
+        spans.append(entry)
     parts = [
         "## Cast bible (JSON)\n" + bible.to_prompt_json(),
         "## Music mood currently playing\n" + chunk.prior_mood,

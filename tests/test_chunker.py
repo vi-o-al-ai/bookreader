@@ -10,13 +10,17 @@ from bookreader.ingest import load_book
 from bookreader.types import Book, Chapter, Paragraph, Span
 
 
-def _chapter(lengths: list[int], index: int = 1) -> Chapter:
-    """A chapter whose paragraph i is a narration span of exactly lengths[i] characters."""
+def _chapter(lengths: list[int], index: int = 1, scene_breaks: set[int] = frozenset()) -> Chapter:
+    """A chapter whose paragraph i is a narration span of exactly lengths[i] characters;
+    paragraphs numbered in *scene_breaks* are flagged ``scene_break_before``."""
     paragraphs = []
     for i, length in enumerate(lengths, start=1):
         text = ("word " * (length // 5 + 1))[:length]
         paragraphs.append(
-            Paragraph(index=i, text=text, spans=[Span(id=f"c{index}p{i}s0", kind="narration", text=text, start_char=0, end_char=length)])
+            Paragraph(
+                index=i, text=text, scene_break_before=i in scene_breaks,
+                spans=[Span(id=f"c{index}p{i}s0", kind="narration", text=text, start_char=0, end_char=length)],
+            )
         )
     return Chapter(index=index, title=f"Chapter {index}", paragraphs=paragraphs)
 
@@ -128,3 +132,40 @@ def test_context_is_not_part_of_chunk_text() -> None:
     chunks = make_chunks(chapter, 50)
     assert chunks[1].text == chapter.paragraphs[1].text
     assert chunks[1].context_before == chapter.paragraphs[0].text
+
+
+# --------------------------------------------------------------------------- scene_break_paragraphs
+@pytest.mark.parametrize("max_chars", [120, 300, 6000])
+def test_scene_break_paragraphs_empty_when_the_chapter_has_none(book: Book, max_chars: int) -> None:
+    # The fixture's double blank lines all precede chapter headings, so ingest turns them into
+    # chapter boundaries rather than scene breaks: no paragraph is flagged, no chunk lists one.
+    assert not any(p.scene_break_before for chapter in book.chapters for p in chapter.paragraphs)
+    for chapter in book.chapters:
+        for chunk in make_chunks(chapter, max_chars):
+            assert chunk.scene_break_paragraphs == []
+
+
+def test_scene_break_paragraphs_list_only_the_chunks_own_paragraphs() -> None:
+    chapter = _chapter([100] * 6, scene_breaks={1, 3, 5})
+    by_limit = {
+        limit: [((c.paragraph_start, c.paragraph_end), c.scene_break_paragraphs) for c in make_chunks(chapter, limit)]
+        for limit in (6000, 202, 100)
+    }
+    assert by_limit[6000] == [((1, 6), [1, 3, 5])]
+    assert by_limit[202] == [((1, 2), [1]), ((3, 4), [3]), ((5, 6), [5])]
+    assert by_limit[100] == [((1, 1), [1]), ((2, 2), []), ((3, 3), [3]), ((4, 4), []), ((5, 5), [5]), ((6, 6), [])]
+    for chunks in by_limit.values():
+        for (start, end), breaks in chunks:
+            assert all(start <= index <= end for index in breaks), "never a paragraph outside the chunk"
+            assert breaks == sorted(breaks)
+
+
+def test_scene_break_paragraphs_come_from_ingest_flags(tmp_path: Path) -> None:
+    paragraph = ("word " * 20).strip()                                   # 99 chars
+    text = "\n\n".join([paragraph, paragraph, "***", paragraph, paragraph]) + "\n\n\n\n" + paragraph + "\n"
+    path = tmp_path / "breaks.txt"
+    path.write_text(text, encoding="utf-8")
+    chapter = load_book(path).chapters[0]
+    assert [p.scene_break_before for p in chapter.paragraphs] == [False, False, True, False, True]
+    assert [c.scene_break_paragraphs for c in make_chunks(chapter, 6000)] == [[3, 5]]
+    assert [c.scene_break_paragraphs for c in make_chunks(chapter, 200)] == [[], [3], [5]]

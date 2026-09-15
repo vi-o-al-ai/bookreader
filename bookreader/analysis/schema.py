@@ -15,7 +15,7 @@ from typing import Any
 
 from bookreader.types import AGES, DELIVERIES, EMOTIONS, GENDERS, MOODS
 
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"
 
 SFX_KINDS: tuple[str, ...] = ("impact", "ambient")
 MUSIC_ACTIONS: tuple[str, ...] = ("start", "change", "stop")

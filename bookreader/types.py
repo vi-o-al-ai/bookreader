@@ -172,6 +172,8 @@ class Chunk(StrictModel):
     spans: list[Span]
     context_before: str = ""                  # previous 2 paragraphs, read-only context
     prior_mood: Mood = "none"                 # music mood in force when this chunk begins
+    # 1-based paragraph indices (within the chapter) that begin a new scene (Paragraph.scene_break_before)
+    scene_break_paragraphs: list[int] = Field(default_factory=list)
 
     @property
     def text(self) -> str:

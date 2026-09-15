@@ -272,6 +272,57 @@ def test_empty_chunk() -> None:
     assert analysis == ChunkAnalysis(source="heuristic")
 
 
+# --------------------------------------------------------------------------- scene breaks
+def test_scene_break_resets_the_conversation(tmp_path: Path) -> None:
+    # Before the break Ann and Bob alternate and Bob addresses Ann by name, so the fallback rule
+    # has a certain partner in hand. After the break narration introduces Cal and an untagged
+    # quote follows: with the conversation reset the only participant is Cal.
+    text = (
+        "Ann and Bob stood on the quay in the grey light while the tide came in and the boats knocked together "
+        "below them, neither of them willing to be the first to speak about the letter that had come up from the "
+        "town that morning.\n\n"
+        '"Shall we go?" Ann asked.\n\n'
+        'Bob shook his head. "Not yet, Ann."\n\n'
+        '"Why not?"\n\n'
+        '"Because it is raining."\n\n\n\n'
+        "Cal came down the cliff path with a lantern in his hand. Cal stopped at the edge of the water and "
+        "lifted the light.\n\n"
+        '"Is anyone there?"\n'
+    )
+    path = tmp_path / "scene.txt"
+    path.write_text(text, encoding="utf-8")
+    chapter = load_book(path).chapters[0]
+    assert [p.index for p in chapter.paragraphs if p.scene_break_before] == [6]
+    chunk = make_chunks(chapter, 6000)[0]
+    assert chunk.scene_break_paragraphs == [6]
+
+    analysis = HeuristicAnalyzer().analyze_chunk(chunk, CastBible())
+    labelled = {label.span_id: label.speaker for label in analysis.labels}
+    assert sorted(labelled) == sorted(span.id for span in chunk.spans if span.kind == "quote")
+    assert [labelled[i] for i in ("c1p2s0", "c1p3s1", "c1p4s0", "c1p5s0")] == ["Ann", "Bob", "Ann", "Bob"]
+    assert labelled["c1p7s0"] == "Cal", "after the break the newly introduced character speaks"
+    assert analysis.warnings == []
+    assert {u.name for u in analysis.characters} == {"Ann", "Bob", "Cal"}
+
+    unaware = HeuristicAnalyzer().analyze_chunk(chunk.model_copy(update={"scene_break_paragraphs": []}), CastBible())
+    leaked = {label.span_id: label.speaker for label in unaware.labels}["c1p7s0"]
+    assert leaked in {"Ann", "Bob"}, "without the scene-break info the pre-break exchange leaks into the new scene"
+
+
+def test_scene_break_lets_the_mood_change_without_lookahead() -> None:
+    def paragraph(index: int, text: str) -> Span:
+        return Span(id=f"c1p{index}s0", kind="narration", text=text, start_char=0, end_char=len(text))
+
+    spans = [paragraph(1, "The morning was quiet."), paragraph(2, "A storm broke over the roof."), paragraph(3, "Nothing else happened.")]
+    with_break = Chunk(chapter_index=1, chunk_index=0, paragraph_start=1, paragraph_end=3, spans=spans, scene_break_paragraphs=[2])
+    cues = HeuristicAnalyzer().analyze_chunk(with_break, CastBible()).music_cues
+    assert [(cue.span_id, cue.action, cue.mood) for cue in cues] == [("c1p1s0", "start", "calm"), ("c1p2s0", "change", "tense")]
+
+    without = with_break.model_copy(update={"scene_break_paragraphs": []})
+    cues = HeuristicAnalyzer().analyze_chunk(without, CastBible()).music_cues
+    assert [(cue.action, cue.mood) for cue in cues] == [("start", "calm")], "an unconfirmed one-paragraph mood is otherwise ignored"
+
+
 # --------------------------------------------------------------------------- provider contract
 def test_provider_contract(mock_settings) -> None:
     analyzer = HeuristicAnalyzer()

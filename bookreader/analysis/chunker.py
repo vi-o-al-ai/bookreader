@@ -2,7 +2,9 @@
 
 Chunks never cross chapters and never split a paragraph: a paragraph that alone exceeds
 ``max_chars`` becomes its own chunk. Sizing counts paragraph text plus the two-character
-separator that :attr:`bookreader.types.Chapter.text` puts between paragraphs.
+separator that :attr:`bookreader.types.Chapter.text` puts between paragraphs. Each chunk
+also lists which of its own paragraphs open a new scene (``Paragraph.scene_break_before``)
+so analyzers can reset conversational state there.
 """
 from __future__ import annotations
 
@@ -19,7 +21,8 @@ PARAGRAPH_SEPARATOR_CHARS = 2   # "\n\n" between paragraphs, as in Chapter.text
 def make_chunks(chapter: Chapter, max_chars: int) -> list[Chunk]:
     """Split *chapter* into chunks of whole paragraphs, each at most *max_chars* characters
     unless a single paragraph is longer. ``prior_mood`` is left at ``"none"``; the analyze
-    stage sets it from the music action in force before each chunk.
+    stage sets it from the music action in force before each chunk. ``scene_break_paragraphs``
+    holds the indices of the chunk's own paragraphs flagged ``scene_break_before``.
     """
     if max_chars < 1:
         raise ValueError("max_chars must be >= 1")
@@ -50,6 +53,7 @@ def make_chunks(chapter: Chapter, max_chars: int) -> list[Chunk]:
                 paragraph_end=group[-1].index,
                 spans=[span for paragraph in group for span in paragraph.spans],
                 context_before="\n\n".join(p.text for p in context),
+                scene_break_paragraphs=[paragraph.index for paragraph in group if paragraph.scene_break_before],
             )
         )
         position += len(group)

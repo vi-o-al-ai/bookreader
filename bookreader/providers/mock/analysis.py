@@ -2,7 +2,8 @@
 
 The mock family's ``analysis`` capability: no model, no network, no randomness. It labels every
 quote span of a chunk with a speaker (explicit tags, pronoun tags, descriptor tags, leading
-subjects, paragraph sharing, reply cues, conversational alternation), infers emotion and
+subjects, paragraph sharing, reply cues, conversational alternation; the conversation resets
+at chapter start, at every scene break the chunk reports and on time transitions), infers emotion and
 delivery from tag verbs and punctuation, harvests characters from narration, emits SFX cues
 anchored to verbatim phrases, and music start/change actions from paragraph mood keywords.
 :func:`bookreader.analysis.validate.validate_chunk_analysis` also uses it to fill labels a
@@ -379,7 +380,8 @@ class _ChunkRun:
         self.warnings: list[str] = []
         self.labels: list[tuple[Span, _Character | None, Emotion, Delivery]] = []
         self.sfx: list[SfxCueRaw] = []
-        self.reset_paragraphs: set[int] = set()
+        self.scene_breaks: frozenset[int] = frozenset(chunk.scene_break_paragraphs)
+        self.reset_paragraphs: set[int] = set()      # where the conversation restarted; a mood change there needs no look-ahead
         all_text = chunk.context_before + " " + " ".join(s.text for s in chunk.spans)
         self.token_counts: Counter[str] = Counter(WORD_RE.findall(all_text))
 
@@ -698,9 +700,16 @@ class _ChunkRun:
         self.warnings.append(f"{span.id}: could not attribute the quote; spoken by the narrator")
         return None, "narrator"
 
+    def _starts_scene(self, paragraph: _Paragraph) -> bool:
+        """True when *paragraph* opens a new scene: flagged by ingest, or narration beginning with a time transition."""
+        if paragraph.index in self.scene_breaks:
+            return True
+        first = paragraph.spans[0]
+        return first.kind == "narration" and TIME_TRANSITION_RE.match(first.text) is not None
+
     def _process_paragraph(self, paragraph: _Paragraph) -> None:
         spans = paragraph.spans
-        if spans[0].kind == "narration" and TIME_TRANSITION_RE.match(spans[0].text):
+        if self._starts_scene(paragraph):
             self.conv.reset()
             self.reset_paragraphs.add(paragraph.index)
         resolved: dict[int, tuple[_Character | None, str]] = {}

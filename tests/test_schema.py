@@ -104,4 +104,4 @@ def test_sample_covers_every_required_key() -> None:
 
 
 def test_prompt_version_is_a_stable_string() -> None:
-    assert PROMPT_VERSION == "1"
+    assert PROMPT_VERSION == "2"

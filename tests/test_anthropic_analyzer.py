@@ -216,7 +216,7 @@ def quote_ids(chunk: Chunk) -> list[str]:
 
 def test_system_prompt_is_stable_and_versioned() -> None:
     assert SYSTEM_PROMPT.endswith(f"prompt-version: {PROMPT_VERSION}")
-    assert SYSTEM_PROMPT.endswith("prompt-version: 1")
+    assert SYSTEM_PROMPT.endswith("prompt-version: 2")
     for word in ("urgent", "whisper", "ominous", "nonbinary", "young_adult", "NARRATOR", "merge_into", "anchor_text"):
         assert word in SYSTEM_PROMPT
 
@@ -238,6 +238,17 @@ def test_user_message_sections(chunk: Chunk, bible: CastBible) -> None:
     assert build_user_message(chunk, bible) == plain, "deterministic"
 
 
+def test_user_message_marks_scene_breaks(chunk: Chunk, bible: CastBible) -> None:
+    marked = chunk.model_copy(update={"scene_break_paragraphs": [4, 8]})
+    text = build_user_message(marked, bible)
+    rendered = json.loads(text.split("## Spans to label (chapter 1, chunk 0)\n", 1)[1])
+    assert [entry["id"] for entry in rendered if entry.get("scene_break") is True] == ["c1p4s0", "c1p8s0"]
+    assert all(set(entry) == {"id", "kind", "text"} for entry in rendered if "scene_break" not in entry)
+    assert [(e["id"], e["kind"], e["text"]) for e in rendered] == [(s.id, s.kind, s.text) for s in chunk.spans]
+    assert "scene_break" not in build_user_message(chunk, bible)
+    assert build_user_message(marked, bible) == text, "deterministic"
+    assert '"scene_break": true' in SYSTEM_PROMPT
+
 
 # --------------------------------------------------------------------------- request shape
 
@@ -247,7 +258,7 @@ def test_request_kwargs_shape(chunk: Chunk, bible: CastBible, good_json: str) ->
     analyzer = make_analyzer(client, effort="high", max_tokens=12345)
     assert isinstance(analyzer, TextAnalyzer)
     assert analyzer.family == "anthropic"
-    assert analyzer.cache_version == "claude-opus-5:1"
+    assert analyzer.cache_version == "claude-opus-5:2"
     assert analyzer.model_id == "claude-opus-5"
 
     result = analyzer.analyze_chunk(chunk, bible)
@@ -543,7 +554,7 @@ def test_from_settings_builds_client_from_secrets(anthropic_stub: types.ModuleTy
     assert analyzer.effort == "low"
     assert analyzer.max_tokens == 8000
     assert analyzer.concurrency == 2
-    assert analyzer.cache_version == "claude-test-1:1"
+    assert analyzer.cache_version == "claude-test-1:2"
     assert isinstance(analyzer.fallback, HeuristicAnalyzer)
     assert analyzer.usage is sink
     analyzer.warmup()
