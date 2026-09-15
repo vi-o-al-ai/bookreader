@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bookreader</title>
+<style>
+  :root { --bg:#f4f4f2; --card:#fff; --ink:#1d1d1b; --muted:#6b6b66; --line:#dedcd6; --accent:#2f5d8a; --ok:#2c7a4b; --warn:#b26a00; --bad:#b3261e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--ink); background:var(--bg); }
+  header { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:baseline; padding:12px 20px; background:var(--card); border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:20px; }
+  header .prov { color:var(--muted); font-size:13px; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:12px; background:#e7e7e2; color:var(--ink); }
+  .badge.ok { background:#dff2e5; color:var(--ok); } .badge.warn { background:#fff1d6; color:var(--warn); } .badge.bad { background:#fbe0de; color:var(--bad); }
+  .badge.done { background:#dff2e5; color:var(--ok); } .badge.running { background:#dce9f7; color:var(--accent); }
+  .badge.queued { background:#eeeeea; } .badge.failed { background:#fbe0de; color:var(--bad); } .badge.cancelled { background:#fff1d6; color:var(--warn); }
+  main { display:flex; gap:16px; padding:16px 20px; align-items:flex-start; }
+  .col-left { flex:0 0 340px; display:flex; flex-direction:column; gap:16px; }
+  .col-right { flex:1 1 0; min-width:0; display:flex; flex-direction:column; gap:16px; }
+  @media (max-width:800px) { main { flex-direction:column; } .col-left { flex:1 1 auto; width:100%; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .card h2 { margin:0 0 10px; font-size:15px; }
+  label { display:block; margin:6px 0; }
+  input[type=text], select { padding:5px 7px; border:1px solid var(--line); border-radius:4px; font:inherit; width:100%; }
+  button { padding:6px 12px; border:1px solid var(--line); border-radius:4px; background:#fafaf8; font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  #jobs { list-style:none; margin:0; padding:0; }
+  #jobs li { padding:8px 6px; border-top:1px solid var(--line); cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
+  #jobs li:first-child { border-top:none; } #jobs li.selected { background:#eef3f8; }
+  #jobs li .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .stepper { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
+  .step { flex:1 1 90px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; }
+  .step.done { border-color:var(--ok); } .step.running { border-color:var(--accent); background:#eef3f8; } .step.failed { border-color:var(--bad); }
+  .step small { display:block; color:var(--muted); }
+  .bar { height:10px; background:#e7e7e2; border-radius:5px; overflow:hidden; }
+  .bar div { height:100%; background:var(--accent); width:0; transition:width .3s; }
+  .muted { color:var(--muted); }
+  .error { border:1px solid var(--bad); background:#fff5f4; border-radius:6px; padding:8px 10px; margin-top:10px; }
+  pre.log { max-height:260px; overflow:auto; background:#1d1d1b; color:#e8e8e2; padding:8px; border-radius:6px; font-size:12px; white-space:pre-wrap; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 6px; border-top:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; border-top:none; }
+  .chapter { border-top:1px solid var(--line); padding:10px 0; }
+  .chapter:first-of-type { border-top:none; }
+  audio { width:100%; margin:6px 0; }
+  .links a { margin-right:10px; font-size:13px; }
+  .transcript { max-height:280px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:6px; margin-top:6px; }
+  .seg { padding:3px 6px; border-radius:4px; cursor:pointer; }
+  .seg.active { background:#fff1d6; }
+  .seg .who { font-weight:600; margin-right:6px; } .seg .emo { color:var(--muted); font-size:12px; margin-right:6px; }
+  .cue { display:inline-block; font-size:11px; color:var(--muted); border:1px dashed var(--line); border-radius:4px; padding:0 4px; margin:2px 0; }
+  details summary { cursor:pointer; margin-bottom:6px; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>bookreader</h1>
+  <span id="providers" class="prov">loading providers…</span>
+  <span id="ffmpeg" class="badge">ffmpeg ?</span>
+  <span id="warnings" class="prov"></span>
+</header>
+<main>
+  <div class="col-left">
+    <section class="card">
+      <h2>Upload a book</h2>
+      <form id="upload">
+        <label>File <input type="file" name="file" accept=".txt,.md,.epub,.pdf" required></label>
+        <label>Title (optional) <input type="text" name="title" placeholder="detected from the book when empty"></label>
+        <div class="row">
+          <label><input type="checkbox" name="music" checked> music</label>
+          <label><input type="checkbox" name="sfx" checked> sound effects</label>
+        </div>
+        <label>Chapters (optional) <input type="text" name="chapters" placeholder="e.g. 1-2"></label>
+        <div class="row"><button class="primary" type="submit">Start</button><span id="upload-msg" class="muted"></span></div>
+      </form>
+    </section>
+    <section class="card">
+      <h2>Jobs</h2>
+      <ul id="jobs"><li class="muted">no jobs yet</li></ul>
+    </section>
+  </div>
+  <div class="col-right">
+    <section class="card" id="panel">
+      <h2 id="panel-title">Select a job</h2>
+      <div id="panel-body" class="hidden">
+        <div class="stepper" id="stepper"></div>
+        <div class="bar"><div id="bar"></div></div>
+        <div class="row" style="margin-top:6px"><span id="pct"></span><span id="message" class="muted"></span></div>
+        <div id="estimate" class="muted"></div>
+        <div id="usage" class="muted"></div>
+        <div id="error" class="error hidden"></div>
+        <div class="row" style="margin-top:10px">
+          <button id="btn-retry">Retry</button>
+          <button id="btn-cancel">Cancel</button>
+          <button id="btn-delete">Delete</button>
+        </div>
+        <details style="margin-top:10px"><summary>Log</summary><pre class="log" id="log"></pre></details>
+      </div>
+    </section>
+    <section class="card hidden" id="cast-card">
+      <h2>Cast</h2>
+      <table id="cast-table"><thead><tr><th>Character</th><th>Aliases</th><th>Gender / age</th><th>Description</th><th>Lines</th><th>Voice</th></tr></thead><tbody></tbody></table>
+      <div class="row" style="margin-top:8px"><button id="btn-recast" class="primary">Apply re-cast</button><span id="cast-msg" class="muted"></span></div>
+    </section>
+    <section class="card hidden" id="chapters-card">
+      <h2>Chapters</h2>
+      <div id="chapters"></div>
+    </section>
+  </div>
+</main>
+<script>
+(function () {
+  'use strict';
+  const state = { jobs: [], selected: null, lastEventId: 0, chapterManifests: {}, status: null, cast: null, manifest: null, bible: null, pollTimer: null, jobsTimer: null };
+  const $ = (id) => document.getElementById(id);
+  const STAGES = ['ingest', 'analyze', 'cast', 'render', 'finalize'];
+  const api = (path, opts) => fetch('api/' + path, opts).then(async (r) => {
+    if (r.status === 204) return null;
+    const type = r.headers.get('content-type') || '';
+    const body = type.includes('json') ? await r.json() : await r.text();
+    if (!r.ok) throw new Error((body && body.detail) || (typeof body === 'string' ? body : r.statusText) || ('HTTP ' + r.status));
+    return body;
+  });
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const fmtMs = (ms) => { const s = Math.round(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  const usd = (v) => '$' + Number(v || 0).toFixed(4);
+  const artifactUrl = (jobId, rel) => 'api/jobs/' + encodeURIComponent(jobId) + '/artifacts/' + rel;
+  const terminal = (s) => s === 'done' || s === 'failed' || s === 'cancelled';
+
+  // ---------------------------------------------------------------- header
+  function loadHealth() {
+    api('health').then((h) => {
+      $('providers').textContent = h.providers.map((p) => p.capability + ': ' + p.family + (p.ok ? '' : ' (error)')).join(' · ');
+      const f = $('ffmpeg'); f.textContent = 'ffmpeg ' + (h.ffmpeg ? 'found (mp3 on)' : 'missing (wav only)'); f.className = 'badge ' + (h.ffmpeg ? 'ok' : 'warn');
+      const warns = h.providers.flatMap((p) => (p.warnings || []).map((w) => p.capability + ': ' + w).concat(p.error ? [p.capability + ': ' + p.error] : []));
+      $('warnings').textContent = warns.join(' | ');
+    }).catch((e) => { $('providers').textContent = 'health check failed: ' + e.message; });
+  }
+
+  // ---------------------------------------------------------------- upload
+  $('upload').addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const form = ev.target;
+    const fd = new FormData();
+    fd.append('file', form.file.files[0]);
+    if (form.title.value.trim()) fd.append('title', form.title.value.trim());
+    const options = { music: form.music.checked, sfx: form.sfx.checked };
+    const range = form.chapters.value.trim();
+    if (range) {
+      const chapters = [];
+      range.split(',').forEach((part) => {
+        const m = part.trim().match(/^(\d+)(?:-(\d+))?$/);
+        if (!m) return;
+        const a = Number(m[1]); const b = m[2] ? Number(m[2]) : a;
+        for (let i = Math.min(a, b); i <= Math.max(a, b); i++) chapters.push(i);
+      });
+      if (chapters.length) options.chapters = chapters;
+    }
+    fd.append('options', JSON.stringify(options));
+    $('upload-msg').textContent = 'uploading…';
+    api('jobs', { method: 'POST', body: fd }).then((res) => {
+      $('upload-msg').textContent = 'queued ' + res.job_id;
+      form.reset();
+      loadJobs().then(() => select(res.job_id));
+    }).catch((e) => { $('upload-msg').textContent = 'error: ' + e.message; });
+  });
+
+  // ---------------------------------------------------------------- jobs list
+  function loadJobs() {
+    return api('jobs').then((res) => {
+      state.jobs = res.jobs;
+      const ul = $('jobs');
+      ul.innerHTML = '';
+      if (!res.jobs.length) { ul.innerHTML = '<li class="muted">no jobs yet</li>'; return; }
+      res.jobs.forEach((j) => {
+        const li = document.createElement('li');
+        li.className = j.id === state.selected ? 'selected' : '';
+        li.innerHTML = '<span class="t" title="' + esc(j.id) + '">' + esc(j.title || j.id) + '</span>' +
+          '<span><span class="badge ' + esc(j.status) + '">' + esc(j.status) + '</span> ' + Math.round(j.overall_pct) + '%</span>';
+        li.addEventListener('click', () => select(j.id));
+        ul.appendChild(li);
+      });
+    }).catch(() => {});
+  }
+
+  // ---------------------------------------------------------------- job panel
+  function select(jobId) {
+    if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+    state.selected = jobId; state.lastEventId = 0; state.chapterManifests = {}; state.cast = null; state.manifest = null; state.status = null;
+    $('log').textContent = '';
+    $('cast-card').classList.add('hidden'); $('chapters-card').classList.add('hidden');
+    $('panel-body').classList.remove('hidden');
+    document.querySelectorAll('#jobs li').forEach((li) => li.classList.toggle('selected', li.title === jobId));
+    poll();
+  }
+
+  function poll() {
+    if (!state.selected) return;
+    const jobId = state.selected;
+    api('jobs/' + encodeURIComponent(jobId)).then((st) => {
+      if (state.selected !== jobId) return;
+      const wasTerminal = state.status && terminal(state.status.status);
+      state.status = st;
+      renderStatus(st);
+      return loadEvents(jobId).then(() => {
+        if (!terminal(st.status) || !wasTerminal) refreshDerived(jobId, st);
+        if (!terminal(st.status)) state.pollTimer = setTimeout(poll, 1000);
+      });
+    }).catch((e) => { $('panel-title').textContent = 'error: ' + e.message; });
+  }
+
+  function renderStatus(st) {
+    $('panel-title').innerHTML = esc(st.title) + ' <span class="badge ' + esc(st.status) + '">' + esc(st.status) + '</span> <small class="muted">' + esc(st.id) + '</small>';
+    const stepper = $('stepper'); stepper.innerHTML = '';
+    st.stages.forEach((s) => {
+      const icon = { done: '✓', running: '▶', failed: '✗', pending: '·' }[s.state] || '·';
+      const div = document.createElement('div');
+      div.className = 'step ' + s.state;
+      div.innerHTML = icon + ' ' + esc(s.stage) + '<small>' + (s.total ? s.done + '/' + s.total : s.state) + '</small>';
+      stepper.appendChild(div);
+    });
+    $('bar').style.width = st.overall_pct + '%';
+    $('pct').textContent = Math.round(st.overall_pct) + '%';
+    const current = st.stages.find((s) => s.state === 'running') || st.stages.find((s) => s.stage === st.stage);
+    $('message').textContent = current && current.message ? current.message : '';
+    const e = st.estimate;
+    $('estimate').textContent = e ? 'Estimate: ' + e.chapters + ' chapters · ' + e.words + ' words · ' + e.chunks + ' chunks · ~' +
+      usd(Object.values(e.cost_usd || {}).reduce((a, b) => a + b, 0)) : '';
+    $('usage').textContent = 'Usage: ' + st.usage.calls + ' calls · ' + st.usage.cache_hits + ' cache hits · ' + usd(st.usage.cost_usd);
+    const err = $('error');
+    if (st.error) {
+      err.classList.remove('hidden');
+      err.innerHTML = '<b>' + esc(st.error.error_type) + '</b> in stage <b>' + esc(st.error.stage) + '</b>' + (st.error.unit ? ' (unit ' + esc(st.error.unit) + ')' : '') +
+        '<br>' + esc(st.error.message) + (st.error.retryable ? '<br><span class="muted">retryable</span>' : '');
+    } else { err.classList.add('hidden'); }
+    $('btn-retry').disabled = !(st.status === 'failed' || st.status === 'cancelled');
+    $('btn-cancel').disabled = terminal(st.status);
+    $('btn-delete').disabled = st.status === 'running';
+  }
+
+  function loadEvents(jobId) {
+    return api('jobs/' + encodeURIComponent(jobId) + '/events?after=' + state.lastEventId).then((res) => {
+      if (state.selected !== jobId || !res.events.length) return;
+      const pre = $('log');
+      res.events.forEach((ev) => { pre.textContent += ev.ts.slice(11, 19) + ' ' + ev.level.toUpperCase().padEnd(5) + ' ' + (ev.stage ? '[' + ev.stage + '] ' : '') + ev.message + '\n'; });
+      pre.scrollTop = pre.scrollHeight;
+      state.lastEventId = res.last_id;
+    }).catch(() => {});
+  }
+
+  function refreshDerived(jobId, st) {
+    const castDone = st.stages.some((s) => s.stage === 'cast' && s.state === 'done');
+    if (castDone && !state.cast) loadCast(jobId);
+    if (st.chapters.some((c) => c.ready)) loadManifest(jobId, st); else $('chapters-card').classList.add('hidden');
+  }
+
+  $('btn-retry').addEventListener('click', () => action('retry', { method: 'POST' }));
+  $('btn-cancel').addEventListener('click', () => action('cancel', { method: 'POST' }));
+  $('btn-delete').addEventListener('click', () => {
+    if (!confirm('Delete this job and its files?')) return;
+    api('jobs/' + encodeURIComponent(state.selected), { method: 'DELETE' }).then(() => {
+      state.selected = null; $('panel-body').classList.add('hidden'); $('panel-title').textContent = 'Select a job';
+      $('cast-card').classList.add('hidden'); $('chapters-card').classList.add('hidden');
+      loadJobs();
+    }).catch((e) => alert(e.message));
+  });
+  function action(name, opts) {
+    api('jobs/' + encodeURIComponent(state.selected) + '/' + name, opts).then(() => { state.cast = null; state.manifest = null; poll(); loadJobs(); }).catch((e) => alert(e.message));
+  }
+
+  // ---------------------------------------------------------------- cast
+  function loadCast(jobId) {
+    Promise.all([
+      api('jobs/' + encodeURIComponent(jobId) + '/cast'),
+      fetch(artifactUrl(jobId, 'bible.json')).then((r) => (r.ok ? r.json() : { characters: [] })).catch(() => ({ characters: [] })),
+    ]).then(([res, bible]) => {
+      if (state.selected !== jobId) return;
+      state.cast = res; state.bible = bible;
+      const tbody = $('cast-table').querySelector('tbody'); tbody.innerHTML = '';
+      const rows = [res.cast.narrator].concat(res.cast.characters);
+      rows.forEach((a) => {
+        const entry = (bible.characters || []).find((c) => c.name === a.character) || {};
+        const tr = document.createElement('tr');
+        const options = res.voices.map((v) => '<option value="' + esc(v.id) + '"' + (v.id === a.voice.id ? ' selected' : '') + '>' + esc(v.name) + ' (' + esc(v.gender) + '/' + esc(v.age) + ')</option>').join('');
+        tr.innerHTML = '<td>' + esc(a.character) + (a.source === 'override' ? ' <span class="badge">pinned</span>' : '') + '</td>' +
+          '<td class="muted">' + esc((entry.aliases || []).join(', ')) + '</td>' +
+          '<td>' + esc(entry.gender || '') + (entry.age ? ' / ' + esc(entry.age) : '') + '</td>' +
+          '<td class="muted">' + esc(entry.description || '') + '</td>' +
+          '<td>' + esc(entry.line_count != null ? entry.line_count : '') + '</td>' +
+          '<td><select data-character="' + esc(a.character) + '" data-current="' + esc(a.voice.id) + '">' + options + '</select></td>';
+        tbody.appendChild(tr);
+      });
+      $('cast-msg').textContent = '';
+      $('cast-card').classList.remove('hidden');
+    }).catch(() => {});
+  }
+
+  $('btn-recast').addEventListener('click', () => {
+    const overrides = {};
+    document.querySelectorAll('#cast-table select').forEach((sel) => { if (sel.value !== sel.dataset.current) overrides[sel.dataset.character] = sel.value; });
+    if (!Object.keys(overrides).length) { $('cast-msg').textContent = 'nothing changed'; return; }
+    $('cast-msg').textContent = 'submitting…';
+    api('jobs/' + encodeURIComponent(state.selected) + '/cast', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ overrides }) })
+      .then(() => { state.cast = null; state.manifest = null; state.chapterManifests = {}; $('cast-card').classList.add('hidden'); poll(); loadJobs(); })
+      .catch((e) => { $('cast-msg').textContent = 'error: ' + e.message; });
+  });
+
+  // ---------------------------------------------------------------- chapters
+  function loadManifest(jobId, st) {
+    api('jobs/' + encodeURIComponent(jobId) + '/manifest').then((m) => {
+      if (state.selected !== jobId) return;
+      const changed = !state.manifest || JSON.stringify(state.manifest.chapters.map((c) => [c.index, c.duration_ms])) !== JSON.stringify(m.chapters.map((c) => [c.index, c.duration_ms]));
+      state.manifest = m;
+      if (changed) renderChapters(jobId, st, m);
+      $('chapters-card').classList.remove('hidden');
+    }).catch(() => {});
+  }
+
+  function renderChapters(jobId, st, manifest) {
+    const root = $('chapters'); root.innerHTML = '';
+    const byIndex = {}; manifest.chapters.forEach((c) => { byIndex[c.index] = c; });
+    st.chapters.forEach((ch) => {
+      const m = byIndex[ch.index];
+      const div = document.createElement('div'); div.className = 'chapter';
+      let html = '<b>' + ch.index + '. ' + esc(ch.title) + '</b> ' + (m ? '<span class="muted">' + fmtMs(m.duration_ms) + '</span>' : '<span class="badge">' + (ch.ready ? 'mixing' : 'pending') + '</span>');
+      if (m) {
+        const src = artifactUrl(jobId, m.files.mp3 || m.files.mix);
+        html += '<audio controls preload="none" src="' + src + '"></audio><div class="links">' +
+          ['voice', 'music', 'sfx'].filter((k) => m.files[k]).map((k) => '<a href="' + artifactUrl(jobId, m.files[k]) + '">' + k + ' stem</a>').join('') +
+          '<a href="' + artifactUrl(jobId, 'chapters/' + String(ch.index).padStart(2, '0') + '/manifest.json') + '">manifest.json</a></div>' +
+          '<div class="transcript"></div>';
+      }
+      div.innerHTML = html;
+      root.appendChild(div);
+      if (m) renderTranscript(div, m);
+    });
+  }
+
+  function renderTranscript(container, chapter) {
+    state.chapterManifests[chapter.index] = chapter;
+    const box = container.querySelector('.transcript');
+    const audio = container.querySelector('audio');
+    const items = chapter.segments.map((s) => ({ t: s.start_ms, html: '<div class="seg" data-start="' + s.start_ms + '" data-end="' + s.end_ms + '"><span class="who">' + esc(s.speaker) + '</span><span class="emo">' + esc(s.emotion) + (s.delivery !== 'normal' ? '/' + esc(s.delivery) : '') + '</span>' + esc(s.text) + '</div>' }))
+      .concat(chapter.cues.map((c) => ({ t: c.start_ms, html: '<span class="cue">' + esc(c.kind) + ' ' + esc(c.kind === 'music' ? (c.mood + ': ' + c.prompt) : c.description) + ' @ ' + fmtMs(c.start_ms) + '</span>' })));
+    items.sort((a, b) => a.t - b.t);
+    box.innerHTML = items.map((i) => i.html).join('');
+    box.querySelectorAll('.seg').forEach((seg) => seg.addEventListener('click', () => { audio.currentTime = Number(seg.dataset.start) / 1000; audio.play(); }));
+    audio.addEventListener('timeupdate', () => {
+      const t = audio.currentTime * 1000;
+      let active = null;
+      box.querySelectorAll('.seg').forEach((seg) => {
+        const on = Number(seg.dataset.start) <= t && t < Number(seg.dataset.end);
+        seg.classList.toggle('active', on);
+        if (on) active = seg;
+      });
+      if (active) active.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  // ---------------------------------------------------------------- boot
+  loadHealth();
+  loadJobs();
+  state.jobsTimer = setInterval(loadJobs, 5000);
+})();
+</script>
+</body>
+</html>

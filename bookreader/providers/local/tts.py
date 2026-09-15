@@ -92,6 +92,22 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _speaker_map(config: dict[str, Any]) -> dict[str, int]:
+    """``{speaker name: id}`` for multi-speaker models (``speaker_id_map`` with > 1 entry, or
+    ``num_speakers`` > 1); empty for single-speaker models or malformed configs."""
+    raw = config.get("speaker_id_map")
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    try:
+        speakers = {str(name): int(speaker_id) for name, speaker_id in raw.items()}
+    except (TypeError, ValueError):
+        log.warning("ignoring malformed speaker_id_map: %r", raw)
+        return {}
+    if len(speakers) > 1 or int(config.get("num_speakers") or 1) > 1:
+        return speakers
+    return {}
+
+
 def _choice(value: Any, choices: tuple[str, ...]) -> str:
     key = str(value or "").strip().lower()
     return key if key in choices else "unknown"
@@ -153,10 +169,10 @@ class PiperTTS:
         for model in _piper_models(self.voices_dir):
             stem = model.name[: -len(".onnx")]
             config = _read_json(model.with_name(model.name + ".json"))
-            speaker_map = config.get("speaker_id_map") or {}
-            if int(config.get("num_speakers") or 1) > 1 and isinstance(speaker_map, dict) and speaker_map:
-                for speaker_name, speaker_id in sorted(speaker_map.items(), key=lambda kv: int(kv[1])):
-                    voice_id = f"{stem}{SPEAKER_SEP}{int(speaker_id)}"
+            speaker_map = _speaker_map(config)
+            if speaker_map:
+                for speaker_name, speaker_id in sorted(speaker_map.items(), key=lambda kv: kv[1]):
+                    voice_id = f"{stem}{SPEAKER_SEP}{speaker_id}"
                     out.append(self._voice_info(voice_id, stem, config, sidecar, speaker=str(speaker_name)))
             else:
                 out.append(self._voice_info(stem, stem, config, sidecar))
