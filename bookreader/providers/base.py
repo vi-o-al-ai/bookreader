@@ -290,6 +290,13 @@ def describe_providers(settings: "Settings") -> list[dict[str, Any]]:
         family = selected_family(settings, capability)
         entry: dict[str, Any] = {"capability": capability, "family": family, "ok": True, "warnings": [], "error": None}
         try:
+            manifest = load_manifest(family)
+            missing = [k for k in manifest.required_secrets if not settings.secrets.get(k)]
+            if missing:
+                hint = f" (pip install 'bookreader[{manifest.extra}]' if not installed)" if manifest.extra else ""
+                raise ProviderConfigError(
+                    f"{capability} provider '{family}' needs environment variable(s) {', '.join(missing)}{hint}"
+                )
             cls = resolve(capability, family)
             entry["class"] = cls.__name__
             entry["warnings"] = list(cls.check(settings))

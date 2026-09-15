@@ -61,3 +61,11 @@ def test_validate_aggregates_missing_secrets_into_one_error():
     msg = str(exc.value)
     assert "ANTHROPIC_API_KEY" in msg and "ELEVENLABS_API_KEY" in msg
     assert "bookreader[anthropic]" in msg and "bookreader[elevenlabs]" in msg
+
+
+def test_describe_reports_missing_secret_as_not_ok():
+    s = Settings.from_env({"BOOKREADER_TTS_PROVIDER": "elevenlabs"})
+    entries = {e["capability"]: e for e in base.describe_providers(s)}
+    assert entries["tts"]["ok"] is False
+    assert "ELEVENLABS_API_KEY" in entries["tts"]["error"]
+    assert entries["analysis"]["ok"] is True
